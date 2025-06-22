@@ -114,9 +114,10 @@ func TestLeaseDropOnReturn(t *testing.T) {
 		t.Fatalf("Worker-1 failed to get lease %s within 5 seconds", leaseName)
 	}
 
-	time.Sleep(1 * time.Second)
+	time.Sleep(100 * time.Millisecond)
 
 	// Now start worker 2
+	t.Logf("Starting worker 2")
 	looper2.Start()
 	defer looper2.Stop()
 
