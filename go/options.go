@@ -3,9 +3,10 @@ package pg_lease
 import "time"
 
 type options struct {
-	loopInterval       time.Duration
-	loopIntervalJitter time.Duration
-	leaseDuration      time.Duration
+	loopInterval           time.Duration
+	loopIntervalJitter     time.Duration
+	leaseDuration          time.Duration
+	leaseHeartbeatInterval time.Duration
 }
 
 type OptionFunc func(*options)
@@ -28,10 +29,17 @@ func WithLeaseDuration(duration time.Duration) OptionFunc {
 	}
 }
 
+func WithLeaseRenewalInterval(interval time.Duration) OptionFunc {
+	return func(o *options) {
+		o.leaseHeartbeatInterval = interval
+	}
+}
+
 func defaultOptions() *options {
 	return &options{
-		loopInterval:       time.Second,
-		loopIntervalJitter: time.Duration(0),
-		leaseDuration:      time.Minute * 5, // 5 minute default lease duration
+		loopInterval:           time.Second,
+		loopIntervalJitter:     time.Duration(0),
+		leaseDuration:          time.Second * 10,
+		leaseHeartbeatInterval: time.Second * 3,
 	}
 }
