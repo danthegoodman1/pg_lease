@@ -5,14 +5,56 @@ use rand::Rng;
 use sqlx::{Pool, Postgres};
 use tokio::{sync::Mutex, task::AbortHandle};
 
-pub struct LeaseLooper<T, Fut>
+/// A lease-based looper that ensures only one worker can execute a task at a time
+/// across multiple processes/machines using PostgreSQL as the coordination mechanism.
+///
+/// The looper function receives shared state of type `S`, allowing you to pass
+/// application-specific data (similar to Axum's state handling).
+///
+/// # Example
+///
+/// ```ignore
+/// use std::sync::Arc;
+/// use tokio::sync::Mutex;
+/// use pg_lease::{LeaseLooper, LeaseLooperOptions};
+///
+/// #[derive(Clone)]
+/// struct AppState {
+///     counter: Arc<Mutex<i32>>,
+///     config: String,
+/// }
+///
+/// let state = AppState {
+///     counter: Arc::new(Mutex::new(0)),
+///     config: "production".to_string(),
+/// };
+///
+/// let looper_func = |state: AppState| async move {
+///     let mut counter = state.counter.lock().await;
+///     *counter += 1;
+///     println!("Counter: {}, Config: {}", *counter, state.config);
+///     Ok(())
+/// };
+///
+/// let looper = LeaseLooper::new(
+///     "my-task".to_string(),
+///     looper_func,
+///     "worker-1".to_string(),
+///     pool,
+///     LeaseLooperOptions::default(),
+///     state,
+/// );
+/// ```
+pub struct LeaseLooper<T, Fut, S>
 where
-    T: Fn() -> Fut + Send + Sync + Clone + 'static,
+    T: Fn(S) -> Fut + Send + Sync + Clone + 'static,
     Fut: Future<Output = Result<(), Box<dyn Error + Send + Sync>>> + Send + 'static,
+    S: Clone + Send + Sync + 'static,
 {
     lease_name: String,
     worker_id: String,
     looper_func: T,
+    state: S,
     options: LeaseLooperOptions,
     pool: Pool<Postgres>,
 
@@ -27,10 +69,11 @@ pub struct LeaseLooperOptions {
     pub lease_heartbeat_interval: Duration,
 }
 
-impl<T, Fut> LeaseLooper<T, Fut>
+impl<T, Fut, S> LeaseLooper<T, Fut, S>
 where
-    T: Fn() -> Fut + Send + Sync + Clone + 'static,
+    T: Fn(S) -> Fut + Send + Sync + Clone + 'static,
     Fut: Future<Output = Result<(), Box<dyn Error + Send + Sync>>> + Send + 'static,
+    S: Clone + Send + Sync + 'static,
 {
     pub fn new(
         lease_name: String,
@@ -38,11 +81,13 @@ where
         worker_id: String,
         pool: Pool<Postgres>,
         options: LeaseLooperOptions,
+        state: S,
     ) -> Self {
         Self {
             lease_name,
             worker_id,
             looper_func,
+            state,
             options,
             pool,
             abort_handle: Arc::new(Mutex::new(None)),
@@ -58,6 +103,7 @@ where
             self.options,
             self.lease_name.clone(),
             self.worker_id.clone(),
+            self.state.clone(),
         ));
 
         *abort_handle = Some(join_handle.abort_handle());
@@ -71,6 +117,7 @@ where
         options: LeaseLooperOptions,
         lease_name: String,
         worker_id: String,
+        state: S,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         println!("launching looper, attempting to create table {}", worker_id);
 
@@ -101,7 +148,7 @@ where
                 continue;
             }
 
-            let looper_handle = tokio::task::spawn(looper_func());
+            let looper_handle = tokio::task::spawn(looper_func(state.clone()));
 
             let heartbeat_handle = tokio::task::spawn(Self::heartbeat_loop(
                 looper_handle.abort_handle(),
@@ -317,10 +364,16 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use std::time::SystemTime;
-    use tokio::sync::mpsc;
+    use tokio::sync::{Mutex as TokioMutex, mpsc};
     use tokio::time::{sleep, timeout};
 
     const TEST_DB_URL: &str = "postgres://postgres:postgres@localhost:5432/postgres";
+
+    #[derive(Clone)]
+    struct SharedState {
+        counter: Arc<TokioMutex<i32>>,
+        message: String,
+    }
 
     #[tokio::test]
     async fn test_lease_heartbeat() -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -342,16 +395,30 @@ mod tests {
         let lease_held_tx = Arc::new(tokio::sync::Mutex::new(Some(lease_held_tx)));
         let lease_complete_tx = Arc::new(tokio::sync::Mutex::new(Some(lease_complete_tx)));
 
+        // Create shared state that the looper function can access
+        let shared_state = SharedState {
+            counter: Arc::new(TokioMutex::new(0)),
+            message: "Hello from shared state!".to_string(),
+        };
+
         let looper_func = {
             let lease_held_tx = lease_held_tx.clone();
             let lease_complete_tx = lease_complete_tx.clone();
             let lease_name = lease_name.clone();
-            move || {
+            move |state: SharedState| {
                 let lease_held_tx = lease_held_tx.clone();
                 let lease_complete_tx = lease_complete_tx.clone();
                 let lease_name = lease_name.clone();
                 async move {
                     println!("Worker acquired lease {}", lease_name);
+                    println!("State message: {}", state.message);
+
+                    // Increment the counter in shared state
+                    {
+                        let mut counter = state.counter.lock().await;
+                        *counter += 1;
+                        println!("Incremented counter to: {}", *counter);
+                    }
 
                     if let Some(tx) = lease_held_tx.lock().await.take() {
                         let _ = tx.send(true).await;
@@ -383,6 +450,7 @@ mod tests {
             "heartbeat-worker".to_string(),
             pool.clone(),
             options,
+            shared_state.clone(),
         );
 
         // Start the looper
@@ -400,8 +468,19 @@ mod tests {
         match lease_completed {
             Ok(Some(true)) => {
                 println!("Successfully held lease for 2x duration via heartbeating");
+
+                // Verify that the shared state was accessed and modified
+                let final_counter = *shared_state.counter.lock().await;
+                println!("Final counter value: {}", final_counter);
+
                 looper.stop().await?;
-                Ok(())
+
+                if final_counter == 1 {
+                    println!("✓ Shared state was correctly accessed and modified");
+                    Ok(())
+                } else {
+                    panic!("Expected counter to be 1, but got {}", final_counter);
+                }
             }
             _ => {
                 looper.stop().await?;
@@ -433,7 +512,7 @@ mod tests {
             let worker1_got_tx = worker1_got_tx.clone();
             let worker1_done_tx = worker1_done_tx.clone();
             let lease_name = lease_name.clone();
-            move || {
+            move |_| {
                 let worker1_got_tx = worker1_got_tx.clone();
                 let worker1_done_tx = worker1_done_tx.clone();
                 let lease_name = lease_name.clone();
@@ -454,7 +533,7 @@ mod tests {
         let worker2_func = {
             let worker2_got_tx = worker2_got_tx.clone();
             let lease_name = lease_name.clone();
-            move || {
+            move |_| {
                 let worker2_got_tx = worker2_got_tx.clone();
                 let lease_name = lease_name.clone();
                 async move {
@@ -482,6 +561,7 @@ mod tests {
             "worker-1".to_string(),
             pool.clone(),
             options,
+            (),
         );
 
         let looper2 = LeaseLooper::new(
@@ -490,6 +570,7 @@ mod tests {
             "worker-2".to_string(),
             pool.clone(),
             options,
+            (),
         );
 
         // Start worker 1 first
@@ -577,7 +658,7 @@ mod tests {
             let verify_result_tx = verify_result_tx.clone();
             let lease_name = lease_name.clone();
             let pool = pool.clone();
-            move || {
+            move |_| {
                 let lease_held_tx = lease_held_tx.clone();
                 let verify_result_tx = verify_result_tx.clone();
                 let lease_name = lease_name.clone();
@@ -592,10 +673,11 @@ mod tests {
                     // Create a temporary LeaseLooper instance to call verify_lease_held
                     let temp_looper = LeaseLooper::new(
                         lease_name.clone(),
-                        || async { Ok(()) },
+                        |_| async { Ok(()) },
                         "verify-worker".to_string(),
                         pool.clone(),
                         LeaseLooperOptions::default(),
+                        (),
                     );
 
                     let held = temp_looper.verify_lease_held(&mut tx).await?;
@@ -624,6 +706,7 @@ mod tests {
             "verify-worker".to_string(),
             pool.clone(),
             options,
+            (),
         );
 
         // Start the looper
@@ -677,7 +760,7 @@ mod tests {
         let worker1_func = {
             let worker1_got_tx = worker1_got_tx.clone();
             let lease_name = lease_name.clone();
-            move || {
+            move |_| {
                 let worker1_got_tx = worker1_got_tx.clone();
                 let lease_name = lease_name.clone();
                 async move {
@@ -696,7 +779,7 @@ mod tests {
         let worker2_func = {
             let worker2_got_tx = worker2_got_tx.clone();
             let lease_name = lease_name.clone();
-            move || {
+            move |_| {
                 let worker2_got_tx = worker2_got_tx.clone();
                 let lease_name = lease_name.clone();
                 async move {
@@ -733,6 +816,7 @@ mod tests {
             "worker-1".to_string(),
             pool.clone(),
             worker1_options,
+            (),
         );
 
         let looper2 = LeaseLooper::new(
@@ -741,6 +825,7 @@ mod tests {
             "worker-2".to_string(),
             pool.clone(),
             worker2_options,
+            (),
         );
 
         // Start worker 1 first
