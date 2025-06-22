@@ -21,18 +21,14 @@ type LeaseLooperFunc func(ctx context.Context) error
 
 type LeaseLooper struct {
 	looperFunc LeaseLooperFunc
-	options    *options
+	options    Options
 	leaseName  string
 	pool       *pgxpool.Pool
 	cancelFunc context.CancelFunc
 	workerID   string
 }
 
-func NewLeaseLooper(looperFunc LeaseLooperFunc, workerID string, leaseName string, pool *pgxpool.Pool, opts ...OptionFunc) *LeaseLooper {
-	options := defaultOptions()
-	for _, opt := range opts {
-		opt(options)
-	}
+func NewLeaseLooper(looperFunc LeaseLooperFunc, workerID string, leaseName string, pool *pgxpool.Pool, options Options) *LeaseLooper {
 	looper := &LeaseLooper{
 		options:    options,
 		looperFunc: looperFunc,
@@ -41,9 +37,9 @@ func NewLeaseLooper(looperFunc LeaseLooperFunc, workerID string, leaseName strin
 		workerID:   workerID,
 	}
 
-	if looper.options.loopIntervalJitter == 0 {
+	if looper.options.LoopIntervalJitter == 0 {
 		// we need something, if 0 it panics
-		looper.options.loopIntervalJitter = time.Nanosecond
+		looper.options.LoopIntervalJitter = time.Nanosecond
 	}
 
 	return looper
@@ -111,7 +107,7 @@ func (looper *LeaseLooper) launch(ctx context.Context) error {
 func (looper *LeaseLooper) acquireLease(ctx context.Context, acquireChan chan struct{}) {
 	fmt.Println("attempting to acquire lease", looper.workerID)
 	for {
-		sleepDuration := looper.options.loopInterval + time.Duration(rand.Int63n(int64(looper.options.loopIntervalJitter)))
+		sleepDuration := looper.options.LoopInterval + time.Duration(rand.Int63n(int64(looper.options.LoopIntervalJitter)))
 		fmt.Println("sleeping for", sleepDuration, looper.workerID)
 		select {
 		case <-ctx.Done():
@@ -149,7 +145,7 @@ func (looper *LeaseLooper) acquireLease(ctx context.Context, acquireChan chan st
 							ELSE _pg_lease.held_until
 						END
 					RETURNING worker_id, held_until`,
-					looper.leaseName, looper.workerID, looper.options.leaseDuration).Scan(&resultWorkerID, &resultHeldUntil)
+					looper.leaseName, looper.workerID, looper.options.LeaseDuration).Scan(&resultWorkerID, &resultHeldUntil)
 
 				if err != nil {
 					fmt.Println("[ERR]", fmt.Errorf("error in lease query %s: %w", looper.workerID, err))
@@ -211,7 +207,7 @@ func (looper *LeaseLooper) leaseHandler(ctx context.Context) error {
 // launchHeartbeatLoop runs in a background goroutine to renew the lease periodically
 func (looper *LeaseLooper) launchHeartbeatLoop(ctx context.Context, cancel context.CancelFunc) {
 	for {
-		sleepDuration := looper.options.loopInterval + time.Duration(rand.Int63n(int64(looper.options.loopIntervalJitter)))
+		sleepDuration := looper.options.LoopInterval + time.Duration(rand.Int63n(int64(looper.options.LoopIntervalJitter)))
 		select {
 		case <-ctx.Done():
 			return
@@ -239,7 +235,7 @@ func (looper *LeaseLooper) renewLease(ctx context.Context) bool {
 		SET held_until = NOW() + $3::interval
 		WHERE name = $1 AND worker_id = $2 AND held_until > NOW()
 		RETURNING worker_id`,
-		looper.leaseName, looper.workerID, looper.options.leaseDuration).Scan(&resultWorkerID)
+		looper.leaseName, looper.workerID, looper.options.LeaseDuration).Scan(&resultWorkerID)
 
 	if err != nil || resultWorkerID != looper.workerID {
 		fmt.Println("lost lease during heartbeat", looper.workerID)

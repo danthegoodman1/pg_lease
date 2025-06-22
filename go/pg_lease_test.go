@@ -40,8 +40,12 @@ func TestLeaseHeartbeat(t *testing.T) {
 			return ctx.Err()
 		}
 	}, "heartbeat-worker", leaseName, pool,
-		WithLeaseDuration(leaseDuration),
-		WithLoopInterval(loopInterval))
+		Options{
+			LeaseDuration:          leaseDuration,
+			LoopInterval:           loopInterval,
+			LoopIntervalJitter:     time.Duration(0),
+			LeaseHeartbeatInterval: time.Second * 3,
+		})
 
 	go func() {
 		err := looper.Start()
@@ -92,8 +96,12 @@ func TestLeaseDropOnReturn(t *testing.T) {
 		worker1Done <- struct{}{}
 		return nil // Return to drop the lease
 	}, "worker-1", leaseName, pool,
-		WithLeaseDuration(leaseDuration),
-		WithLoopInterval(loopInterval))
+		Options{
+			LeaseDuration:          leaseDuration,
+			LoopInterval:           loopInterval,
+			LoopIntervalJitter:     time.Duration(0),
+			LeaseHeartbeatInterval: time.Second * 3,
+		})
 
 	// Worker 2: Waits to get the lease
 	looper2 := NewLeaseLooper(func(ctx context.Context) error {
@@ -102,8 +110,12 @@ func TestLeaseDropOnReturn(t *testing.T) {
 		<-ctx.Done() // Hold until stopped
 		return ctx.Err()
 	}, "worker-2", leaseName, pool,
-		WithLeaseDuration(leaseDuration),
-		WithLoopInterval(loopInterval))
+		Options{
+			LeaseDuration:          leaseDuration,
+			LoopInterval:           loopInterval,
+			LoopIntervalJitter:     time.Duration(0),
+			LeaseHeartbeatInterval: time.Second * 3,
+		})
 
 	// Start worker 1 first
 	go func() {
