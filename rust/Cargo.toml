@@ -4,5 +4,6 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+rand = "0.9.1"
 sqlx = { version = "0.8.6", features = ["postgres"] }
 tokio = { version = "1.45.1", features = ["full"] }
