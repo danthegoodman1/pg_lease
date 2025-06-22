@@ -41,6 +41,11 @@ func NewLeaseLooper(looperFunc LeaseLooperFunc, workerID string, leaseName strin
 		workerID:   workerID,
 	}
 
+	if looper.options.loopIntervalJitter == 0 {
+		// we need something, if 0 it panics
+		looper.options.loopIntervalJitter = time.Nanosecond
+	}
+
 	return looper
 }
 
@@ -111,6 +116,7 @@ func (looper *LeaseLooper) acquireLease(ctx context.Context, acquireChan chan st
 		select {
 		case <-ctx.Done():
 			fmt.Println("context canceled in acquireLease, exiting", looper.workerID)
+			return
 		case <-time.After(sleepDuration):
 			// Try to acquire the lease
 			acquired := func() bool {
