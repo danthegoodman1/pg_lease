@@ -93,6 +93,10 @@ func (looper *LeaseLooper) launch(ctx context.Context) error {
 		err = looper.leaseHandler(ctx)
 		if err == nil {
 			fmt.Println("LeaseLooperFunc returned, dropping lease")
+			// Use a fresh context with timeout for dropping the lease
+			dropCtx, cancel := context.WithTimeout(context.Background(), time.Second*5)
+			defer cancel()
+			looper.dropLease(dropCtx)
 			return nil
 		} else if errors.Is(err, context.Canceled) {
 			fmt.Println("context canceled, exiting")
@@ -107,6 +111,69 @@ func (looper *LeaseLooper) launch(ctx context.Context) error {
 func (looper *LeaseLooper) acquireLease(ctx context.Context, acquireChan chan struct{}) {
 	fmt.Println("attempting to acquire lease", looper.workerID)
 	for {
+		// Try to acquire the lease
+		acquired := func() bool {
+			conn, err := looper.pool.Acquire(ctx)
+			if err != nil {
+				fmt.Println("[ERR]", fmt.Errorf("error acquiring connection %s: %w", looper.workerID, err))
+				return false
+			}
+			defer conn.Release()
+
+			tx, err := conn.Begin(ctx)
+			if err != nil {
+				fmt.Println("[ERR]", fmt.Errorf("error in conn.Begin %s: %w", looper.workerID, err))
+				return false
+			}
+
+			// Try to insert the lease record if the record doesn't exist, or if it's expired
+			var resultWorkerID string
+			var resultHeldUntil time.Time
+			err = tx.QueryRow(ctx, `
+				INSERT INTO _pg_lease (name, worker_id, held_until)
+				VALUES ($1, $2, NOW() + $3::interval)
+				ON CONFLICT (name) DO UPDATE SET
+					worker_id = CASE
+						WHEN _pg_lease.held_until < NOW() THEN $2
+						ELSE _pg_lease.worker_id
+					END,
+					held_until = CASE
+						WHEN _pg_lease.held_until < NOW() THEN NOW() + $3::interval
+						ELSE _pg_lease.held_until
+					END
+				RETURNING worker_id, held_until`,
+				looper.leaseName, looper.workerID, looper.options.LeaseDuration).Scan(&resultWorkerID, &resultHeldUntil)
+
+			if err != nil {
+				fmt.Println("[ERR]", fmt.Errorf("error in lease query %s: %w", looper.workerID, err))
+				tx.Rollback(ctx)
+				return false
+			}
+
+			// Check if we successfully acquired the lease
+			if resultWorkerID == looper.workerID {
+				err = tx.Commit(ctx)
+				if err != nil {
+					fmt.Println("[ERR]", fmt.Errorf("error committing lease transaction %s: %w", looper.workerID, err))
+					return false
+				}
+
+				fmt.Println("successfully acquired lease", looper.workerID)
+				return true
+			} else {
+				// Someone else holds the lease and it's not expired
+				tx.Rollback(ctx)
+				fmt.Println("lease held by another worker:", resultWorkerID, "until:", resultHeldUntil, looper.workerID)
+				return false
+			}
+		}()
+
+		if acquired {
+			acquireChan <- struct{}{}
+			return
+		}
+
+		// Sleep before the next attempt
 		sleepDuration := looper.options.LoopInterval + time.Duration(rand.Int63n(int64(looper.options.LoopIntervalJitter)))
 		fmt.Println("sleeping for", sleepDuration, looper.workerID)
 		select {
@@ -114,67 +181,7 @@ func (looper *LeaseLooper) acquireLease(ctx context.Context, acquireChan chan st
 			fmt.Println("context canceled in acquireLease, exiting", looper.workerID)
 			return
 		case <-time.After(sleepDuration):
-			// Try to acquire the lease
-			acquired := func() bool {
-				conn, err := looper.pool.Acquire(ctx)
-				if err != nil {
-					fmt.Println("[ERR]", fmt.Errorf("error acquiring connection %s: %w", looper.workerID, err))
-					return false
-				}
-				defer conn.Release()
-
-				tx, err := conn.Begin(ctx)
-				if err != nil {
-					fmt.Println("[ERR]", fmt.Errorf("error in conn.Begin %s: %w", looper.workerID, err))
-					return false
-				}
-
-				// Try to insert the lease record if the record doesn't exist, or if it's expired
-				var resultWorkerID string
-				var resultHeldUntil time.Time
-				err = tx.QueryRow(ctx, `
-					INSERT INTO _pg_lease (name, worker_id, held_until)
-					VALUES ($1, $2, NOW() + $3::interval)
-					ON CONFLICT (name) DO UPDATE SET
-						worker_id = CASE
-							WHEN _pg_lease.held_until < NOW() THEN $2
-							ELSE _pg_lease.worker_id
-						END,
-						held_until = CASE
-							WHEN _pg_lease.held_until < NOW() THEN NOW() + $3::interval
-							ELSE _pg_lease.held_until
-						END
-					RETURNING worker_id, held_until`,
-					looper.leaseName, looper.workerID, looper.options.LeaseDuration).Scan(&resultWorkerID, &resultHeldUntil)
-
-				if err != nil {
-					fmt.Println("[ERR]", fmt.Errorf("error in lease query %s: %w", looper.workerID, err))
-					tx.Rollback(ctx)
-					return false
-				}
-
-				// Check if we successfully acquired the lease
-				if resultWorkerID == looper.workerID {
-					err = tx.Commit(ctx)
-					if err != nil {
-						fmt.Println("[ERR]", fmt.Errorf("error committing lease transaction %s: %w", looper.workerID, err))
-						return false
-					}
-
-					fmt.Println("successfully acquired lease", looper.workerID)
-					return true
-				} else {
-					// Someone else holds the lease and it's not expired
-					tx.Rollback(ctx)
-					fmt.Println("lease held by another worker:", resultWorkerID, "until:", resultHeldUntil, looper.workerID)
-					return false
-				}
-			}()
-
-			if acquired {
-				acquireChan <- struct{}{}
-				return
-			}
+			// Continue to the next iteration
 		}
 	}
 }
@@ -243,6 +250,27 @@ func (looper *LeaseLooper) renewLease(ctx context.Context) bool {
 	}
 
 	return true
+}
+
+// dropLease attempts to delete the lease if we still own it
+func (looper *LeaseLooper) dropLease(ctx context.Context) {
+	conn, err := looper.pool.Acquire(ctx)
+	if err != nil {
+		fmt.Println("error acquiring connection for dropping lease:", err.Error(), looper.workerID)
+		return
+	}
+	defer conn.Release()
+
+	_, err = conn.Exec(ctx, `
+		DELETE FROM _pg_lease
+		WHERE name = $1 AND worker_id = $2`,
+		looper.leaseName, looper.workerID)
+
+	if err != nil {
+		fmt.Println("error dropping lease:", err.Error(), looper.workerID)
+	} else {
+		fmt.Println("successfully dropped lease", looper.workerID)
+	}
 }
 
 // VerifyLeaseHeld will transactionally verify that a lease is still held
