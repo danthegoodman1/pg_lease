@@ -516,12 +516,13 @@ mod tests {
         println!("Starting worker 2");
         looper2.start().await?;
 
-        // Wait for worker 1 to finish and then stop it
+        // Wait for worker 1 to finish - it should drop the lease naturally
         let worker1_finished = timeout(Duration::from_secs(3), worker1_done_rx.recv()).await;
         match worker1_finished {
             Ok(Some(true)) => {
-                println!("Worker-1 finished, stopping it");
-                looper1.stop().await?;
+                println!("Worker-1 finished and should have dropped lease naturally");
+                // Give a moment for the lease to be dropped
+                sleep(Duration::from_millis(200)).await;
             }
             _ => panic!("Worker-1 did not finish within 3 seconds"),
         }
@@ -537,10 +538,14 @@ mod tests {
                     "Worker-2 successfully acquired lease {} after worker-1 dropped it",
                     lease_name
                 );
+                // Clean up both loopers
+                looper1.stop().await?;
                 looper2.stop().await?;
                 Ok(())
             }
             _ => {
+                // Clean up both loopers on failure
+                looper1.stop().await?;
                 looper2.stop().await?;
                 panic!(
                     "Worker-2 failed to get lease {} within 5 seconds after worker-1 returned",
