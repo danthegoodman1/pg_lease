@@ -26,7 +26,7 @@ func TestLeaseHeartbeat(t *testing.T) {
 	leaseHeld := make(chan bool, 1)
 	leaseComplete := make(chan bool, 1)
 
-	looper := NewLeaseLooper(func(ctx context.Context) error {
+	looper := NewLeaseLooper(func(leaseContext LeaseContext) error {
 		t.Logf("Worker acquired lease %s", leaseName)
 		leaseHeld <- true
 
@@ -36,9 +36,9 @@ func TestLeaseHeartbeat(t *testing.T) {
 			t.Logf("Worker held lease for 2x duration, returning")
 			leaseComplete <- true
 			return nil
-		case <-ctx.Done():
-			t.Logf("Worker context canceled: %v", ctx.Err())
-			return ctx.Err()
+		case <-leaseContext.Context.Done():
+			t.Logf("Worker context canceled: %v", leaseContext.Context.Err())
+			return leaseContext.Context.Err()
 		}
 	}, "heartbeat-worker", leaseName, pool,
 		Options{
@@ -89,7 +89,7 @@ func TestLeaseDropOnReturn(t *testing.T) {
 	worker2Got := make(chan string, 1)
 
 	// Worker 1: Returns after 1 second
-	looper1 := NewLeaseLooper(func(ctx context.Context) error {
+	looper1 := NewLeaseLooper(func(leaseContext LeaseContext) error {
 		t.Logf("Worker-1 acquired lease %s", leaseName)
 		worker1Got <- "worker-1"
 		time.Sleep(1 * time.Second)
@@ -105,11 +105,11 @@ func TestLeaseDropOnReturn(t *testing.T) {
 		})
 
 	// Worker 2: Waits to get the lease
-	looper2 := NewLeaseLooper(func(ctx context.Context) error {
+	looper2 := NewLeaseLooper(func(leaseContext LeaseContext) error {
 		t.Logf("Worker-2 acquired lease %s", leaseName)
 		worker2Got <- "worker-2"
-		<-ctx.Done() // Hold until stopped
-		return ctx.Err()
+		<-leaseContext.Context.Done() // Hold until stopped
+		return leaseContext.Context.Err()
 	}, "worker-2", leaseName, pool,
 		Options{
 			LeaseDuration:          leaseDuration,
@@ -185,29 +185,28 @@ func TestVerifyLeaseHeld(t *testing.T) {
 	verifyResult := make(chan bool, 1)
 
 	var looper *LeaseLooper
-	looper = NewLeaseLooper(func(ctx context.Context) error {
+	looper = NewLeaseLooper(func(leaseContext LeaseContext) error {
 		t.Logf("Worker acquired lease %s", leaseName)
 		leaseHeld <- true
 
 		// Acquire a connection and start a transaction to verify the lease is held
-		conn, err := pool.Acquire(ctx)
+		conn, err := pool.Acquire(leaseContext.Context)
 		if err != nil {
 			t.Errorf("Failed to acquire connection: %v", err)
 			return err
 		}
 		defer conn.Release()
 
-		txn, err := conn.BeginTx(ctx, pgx.TxOptions{})
+		txn, err := conn.BeginTx(leaseContext.Context, pgx.TxOptions{})
 		if err != nil {
 			t.Errorf("Failed to begin transaction: %v", err)
 			return err
 		}
-		defer txn.Rollback(ctx)
 
-		held, err := looper.VerifyLeaseHeld(ctx, txn)
+		held, err := looper.VerifyLeaseHeld(leaseContext.Context, txn)
 		if err != nil {
 			t.Errorf("VerifyLeaseHeld failed: %v", err)
-			return err
+			return fmt.Errorf("VerifyLeaseHeld failed: %w", err)
 		}
 
 		verifyResult <- held
@@ -269,15 +268,15 @@ func TestLeaseHeartbeatFailure(t *testing.T) {
 	worker2Got := make(chan bool, 1)
 
 	// Worker 1: Has broken heartbeat (too long interval)
-	looper1 := NewLeaseLooper(func(ctx context.Context) error {
+	looper1 := NewLeaseLooper(func(leaseContext LeaseContext) error {
 		t.Logf("Worker-1 acquired lease %s", leaseName)
 		worker1Got <- true
 
 		// Wait for context cancellation due to lost lease
-		<-ctx.Done()
+		<-leaseContext.Context.Done()
 		t.Logf("Worker-1 lost lease as expected due to failed heartbeating")
 		worker1Lost <- true
-		return ctx.Err()
+		return leaseContext.Context.Err()
 	}, "worker-1", leaseName, pool,
 		Options{
 			LeaseDuration:          leaseDuration,
@@ -287,11 +286,11 @@ func TestLeaseHeartbeatFailure(t *testing.T) {
 		})
 
 	// Worker 2: Has proper heartbeat to steal the lease
-	looper2 := NewLeaseLooper(func(ctx context.Context) error {
+	looper2 := NewLeaseLooper(func(leaseContext LeaseContext) error {
 		t.Logf("Worker-2 acquired lease %s", leaseName)
 		worker2Got <- true
-		<-ctx.Done() // Hold until stopped
-		return ctx.Err()
+		<-leaseContext.Context.Done() // Hold until stopped
+		return leaseContext.Context.Err()
 	}, "worker-2", leaseName, pool,
 		Options{
 			LeaseDuration:          leaseDuration,

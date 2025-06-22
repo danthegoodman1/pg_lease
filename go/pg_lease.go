@@ -11,13 +11,19 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+type LeaseContext struct {
+	LeaseName string
+	WorkerID  string
+	Context   context.Context
+}
+
 // LeaseLooperFunc is called when the lease is held, and should loop while it wants to
 // keep the lease.
 //
 // The ctx will be canceled when the lease is lost.
 //
 // Returning from this function drops the lease.
-type LeaseLooperFunc func(ctx context.Context) error
+type LeaseLooperFunc func(leaseContext LeaseContext) error
 
 type LeaseLooper struct {
 	looperFunc LeaseLooperFunc
@@ -184,7 +190,11 @@ func (looper *LeaseLooper) leaseHandler(ctx context.Context) error {
 
 	looperFuncChan := make(chan error)
 	go func() {
-		looperFuncChan <- looper.looperFunc(leaseCtx)
+		looperFuncChan <- looper.looperFunc(LeaseContext{
+			LeaseName: looper.leaseName,
+			WorkerID:  looper.workerID,
+			Context:   leaseCtx,
+		})
 	}()
 
 	go looper.launchHeartbeatLoop(leaseCtx, cancel)
