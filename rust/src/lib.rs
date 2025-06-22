@@ -409,4 +409,372 @@ mod tests {
             }
         }
     }
+
+    #[tokio::test]
+    async fn test_lease_drop_on_return() -> Result<(), Box<dyn Error + Send + Sync>> {
+        let pool = sqlx::PgPool::connect(TEST_DB_URL).await?;
+
+        let lease_name = format!(
+            "test-lease-drop-{}",
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let lease_duration = Duration::from_secs(5);
+        let loop_interval = Duration::from_millis(200);
+
+        let (worker1_got_tx, mut worker1_got_rx) = mpsc::channel::<String>(1);
+        let (worker1_done_tx, mut worker1_done_rx) = mpsc::channel::<bool>(1);
+        let (worker2_got_tx, mut worker2_got_rx) = mpsc::channel::<String>(1);
+
+        // Worker 1: Returns after 1 second
+        let worker1_func = {
+            let worker1_got_tx = worker1_got_tx.clone();
+            let worker1_done_tx = worker1_done_tx.clone();
+            let lease_name = lease_name.clone();
+            move || {
+                let worker1_got_tx = worker1_got_tx.clone();
+                let worker1_done_tx = worker1_done_tx.clone();
+                let lease_name = lease_name.clone();
+                async move {
+                    println!("Worker-1 acquired lease {}", lease_name);
+                    let _ = worker1_got_tx.send("worker-1".to_string()).await;
+
+                    sleep(Duration::from_secs(1)).await;
+                    println!("Worker-1 returning to drop lease {}", lease_name);
+                    let _ = worker1_done_tx.send(true).await;
+
+                    Ok(()) // Return to drop the lease
+                }
+            }
+        };
+
+        // Worker 2: Waits to get the lease
+        let worker2_func = {
+            let worker2_got_tx = worker2_got_tx.clone();
+            let lease_name = lease_name.clone();
+            move || {
+                let worker2_got_tx = worker2_got_tx.clone();
+                let lease_name = lease_name.clone();
+                async move {
+                    println!("Worker-2 acquired lease {}", lease_name);
+                    let _ = worker2_got_tx.send("worker-2".to_string()).await;
+
+                    // Hold until we get cancelled (when test ends)
+                    loop {
+                        sleep(Duration::from_secs(1)).await;
+                    }
+                }
+            }
+        };
+
+        let options = LeaseLooperOptions {
+            loop_interval,
+            loop_interval_jitter: Duration::from_secs(0),
+            lease_duration,
+            lease_heartbeat_interval: Duration::from_secs(1),
+        };
+
+        let looper1 = LeaseLooper::new(
+            lease_name.clone(),
+            worker1_func,
+            "worker-1".to_string(),
+            pool.clone(),
+            options,
+        );
+
+        let looper2 = LeaseLooper::new(
+            lease_name.clone(),
+            worker2_func,
+            "worker-2".to_string(),
+            pool.clone(),
+            options,
+        );
+
+        // Start worker 1 first
+        looper1.start().await?;
+
+        // Wait for worker 1 to get the lease
+        let worker1_acquired = timeout(Duration::from_secs(5), worker1_got_rx.recv()).await;
+        match worker1_acquired {
+            Ok(Some(worker_id)) => {
+                if worker_id != "worker-1" {
+                    panic!("Expected worker-1, got {}", worker_id);
+                }
+                println!("Worker-1 successfully acquired lease {}", lease_name);
+            }
+            _ => panic!(
+                "Worker-1 failed to get lease {} within 5 seconds",
+                lease_name
+            ),
+        }
+
+        sleep(Duration::from_millis(100)).await;
+
+        // Now start worker 2
+        println!("Starting worker 2");
+        looper2.start().await?;
+
+        // Wait for worker 1 to finish and then stop it
+        let worker1_finished = timeout(Duration::from_secs(3), worker1_done_rx.recv()).await;
+        match worker1_finished {
+            Ok(Some(true)) => {
+                println!("Worker-1 finished, stopping it");
+                looper1.stop().await?;
+            }
+            _ => panic!("Worker-1 did not finish within 3 seconds"),
+        }
+
+        // Wait for worker 2 to get the lease after worker 1 returns
+        let worker2_acquired = timeout(Duration::from_secs(5), worker2_got_rx.recv()).await;
+        match worker2_acquired {
+            Ok(Some(worker_id)) => {
+                if worker_id != "worker-2" {
+                    panic!("Expected worker-2, got {}", worker_id);
+                }
+                println!(
+                    "Worker-2 successfully acquired lease {} after worker-1 dropped it",
+                    lease_name
+                );
+                looper2.stop().await?;
+                Ok(())
+            }
+            _ => {
+                looper2.stop().await?;
+                panic!(
+                    "Worker-2 failed to get lease {} within 5 seconds after worker-1 returned",
+                    lease_name
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_verify_lease_held() -> Result<(), Box<dyn Error + Send + Sync>> {
+        let pool = sqlx::PgPool::connect(TEST_DB_URL).await?;
+
+        let lease_name = format!(
+            "test-lease-verify-{}",
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let lease_duration = Duration::from_secs(2);
+        let loop_interval = Duration::from_millis(500);
+
+        let (lease_held_tx, mut lease_held_rx) = mpsc::channel::<bool>(1);
+        let (verify_result_tx, mut verify_result_rx) = mpsc::channel::<bool>(1);
+
+        let looper_func = {
+            let lease_held_tx = lease_held_tx.clone();
+            let verify_result_tx = verify_result_tx.clone();
+            let lease_name = lease_name.clone();
+            let pool = pool.clone();
+            move || {
+                let lease_held_tx = lease_held_tx.clone();
+                let verify_result_tx = verify_result_tx.clone();
+                let lease_name = lease_name.clone();
+                let pool = pool.clone();
+                async move {
+                    println!("Worker acquired lease {}", lease_name);
+                    let _ = lease_held_tx.send(true).await;
+
+                    // Start a transaction to verify the lease is held
+                    let mut tx = pool.begin().await?;
+
+                    // Create a temporary LeaseLooper instance to call verify_lease_held
+                    let temp_looper = LeaseLooper::new(
+                        lease_name.clone(),
+                        || async { Ok(()) },
+                        "verify-worker".to_string(),
+                        pool.clone(),
+                        LeaseLooperOptions::default(),
+                    );
+
+                    let held = temp_looper.verify_lease_held(&mut tx).await?;
+                    tx.rollback().await?;
+
+                    println!("VerifyLeaseHeld returned: {}", held);
+                    let _ = verify_result_tx.send(held).await;
+
+                    // Hold the lease for a bit then return
+                    sleep(Duration::from_millis(500)).await;
+                    Ok(())
+                }
+            }
+        };
+
+        let options = LeaseLooperOptions {
+            loop_interval,
+            loop_interval_jitter: Duration::from_secs(0),
+            lease_duration,
+            lease_heartbeat_interval: Duration::from_millis(500),
+        };
+
+        let looper = LeaseLooper::new(
+            lease_name.clone(),
+            looper_func,
+            "verify-worker".to_string(),
+            pool.clone(),
+            options,
+        );
+
+        // Start the looper
+        looper.start().await?;
+
+        // Wait for lease to be acquired
+        let lease_acquired = timeout(Duration::from_secs(5), lease_held_rx.recv()).await;
+        match lease_acquired {
+            Ok(Some(true)) => println!("Successfully acquired lease {}", lease_name),
+            _ => panic!("Failed to acquire lease {} within 5 seconds", lease_name),
+        }
+
+        // Wait for verification result
+        let verify_result = timeout(Duration::from_secs(2), verify_result_rx.recv()).await;
+        match verify_result {
+            Ok(Some(held)) => {
+                if !held {
+                    looper.stop().await?;
+                    panic!("Expected VerifyLeaseHeld to return true when lease is held, got false");
+                } else {
+                    println!("VerifyLeaseHeld correctly returned true for held lease");
+                    looper.stop().await?;
+                    Ok(())
+                }
+            }
+            _ => {
+                looper.stop().await?;
+                panic!("VerifyLeaseHeld did not return result within 2 seconds");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_lease_heartbeat_failure() -> Result<(), Box<dyn Error + Send + Sync>> {
+        let pool = sqlx::PgPool::connect(TEST_DB_URL).await?;
+
+        let lease_name = format!(
+            "test-lease-heartbeat-fail-{}",
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let lease_duration = Duration::from_millis(800); // Short lease duration
+        let loop_interval = Duration::from_millis(100);
+
+        let (worker1_got_tx, mut worker1_got_rx) = mpsc::channel::<bool>(1);
+        let (worker1_lost_tx, mut worker1_lost_rx) = mpsc::channel::<bool>(1);
+        let (worker2_got_tx, mut worker2_got_rx) = mpsc::channel::<bool>(1);
+
+        // Worker 1: Has broken heartbeat (too long interval)
+        let worker1_func = {
+            let worker1_got_tx = worker1_got_tx.clone();
+            let worker1_lost_tx = worker1_lost_tx.clone();
+            let lease_name = lease_name.clone();
+            move || {
+                let worker1_got_tx = worker1_got_tx.clone();
+                let worker1_lost_tx = worker1_lost_tx.clone();
+                let lease_name = lease_name.clone();
+                async move {
+                    println!("Worker-1 acquired lease {}", lease_name);
+                    let _ = worker1_got_tx.send(true).await;
+
+                    // This will run until cancelled due to lost lease from broken heartbeat
+                    loop {
+                        sleep(Duration::from_millis(100)).await;
+                    }
+                }
+            }
+        };
+
+        // Worker 2: Has proper heartbeat to steal the lease
+        let worker2_func = {
+            let worker2_got_tx = worker2_got_tx.clone();
+            let lease_name = lease_name.clone();
+            move || {
+                let worker2_got_tx = worker2_got_tx.clone();
+                let lease_name = lease_name.clone();
+                async move {
+                    println!("Worker-2 acquired lease {}", lease_name);
+                    let _ = worker2_got_tx.send(true).await;
+
+                    // Hold until we get cancelled (when test ends)
+                    loop {
+                        sleep(Duration::from_secs(1)).await;
+                    }
+                }
+            }
+        };
+
+        // Worker 1 options with broken heartbeat
+        let worker1_options = LeaseLooperOptions {
+            loop_interval,
+            loop_interval_jitter: Duration::from_secs(0),
+            lease_duration,
+            lease_heartbeat_interval: Duration::from_secs(2), // Much longer than lease duration - should fail
+        };
+
+        // Worker 2 options with proper heartbeat
+        let worker2_options = LeaseLooperOptions {
+            loop_interval,
+            loop_interval_jitter: Duration::from_secs(0),
+            lease_duration,
+            lease_heartbeat_interval: Duration::from_millis(200), // Proper heartbeat interval
+        };
+
+        let looper1 = LeaseLooper::new(
+            lease_name.clone(),
+            worker1_func,
+            "worker-1".to_string(),
+            pool.clone(),
+            worker1_options,
+        );
+
+        let looper2 = LeaseLooper::new(
+            lease_name.clone(),
+            worker2_func,
+            "worker-2".to_string(),
+            pool.clone(),
+            worker2_options,
+        );
+
+        // Start worker 1 first
+        looper1.start().await?;
+
+        // Wait for worker 1 to get the lease
+        let worker1_acquired = timeout(Duration::from_secs(5), worker1_got_rx.recv()).await;
+        match worker1_acquired {
+            Ok(Some(true)) => println!("Worker-1 acquired lease"),
+            _ => panic!("Worker-1 failed to acquire lease within 5 seconds"),
+        }
+
+        // Start worker 2 which should steal the lease
+        looper2.start().await?;
+
+        // Wait for worker 2 to steal the lease
+        let worker2_acquired = timeout(Duration::from_secs(3), worker2_got_rx.recv()).await;
+        match worker2_acquired {
+            Ok(Some(true)) => println!("Worker-2 stole the lease"),
+            _ => {
+                looper1.stop().await?;
+                looper2.stop().await?;
+                panic!("Worker-2 should have stolen the lease within 3 seconds");
+            }
+        }
+
+        // Give a moment for worker1 to detect it lost the lease and get cancelled
+        sleep(Duration::from_millis(500)).await;
+
+        // Stop both workers
+        looper1.stop().await?;
+        looper2.stop().await?;
+
+        println!(
+            "Test passed: Worker-2 successfully stole lease from Worker-1 with broken heartbeat"
+        );
+        Ok(())
+    }
 }
