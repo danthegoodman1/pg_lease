@@ -2,9 +2,8 @@ use std::{error::Error, future::Future, sync::Arc, time::Duration};
 
 use chrono::{DateTime, Utc};
 use rand::Rng;
-use sqlx::{Acquire, Pool, Postgres, pool::PoolConnection};
+use sqlx::{Pool, Postgres};
 use tokio::{sync::Mutex, task::AbortHandle};
-use tokio_util::sync::CancellationToken;
 
 pub struct LeaseLooper<T, Fut>
 where
