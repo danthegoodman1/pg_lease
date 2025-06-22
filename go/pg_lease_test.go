@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -166,5 +167,88 @@ func TestLeaseDropOnReturn(t *testing.T) {
 		t.Logf("Worker-2 successfully acquired lease %s after worker-1 dropped it", leaseName)
 	case <-time.After(5 * time.Second):
 		t.Fatalf("Worker-2 failed to get lease %s within 5 seconds after worker-1 returned", leaseName)
+	}
+}
+
+func TestVerifyLeaseHeld(t *testing.T) {
+	pool, err := pgxpool.New(context.Background(), testDBURL)
+	if err != nil {
+		t.Fatalf("Failed to connect to database: %v", err)
+	}
+	defer pool.Close()
+
+	leaseName := fmt.Sprintf("test-lease-verify-%d", time.Now().UnixNano())
+	leaseDuration := 2 * time.Second
+	loopInterval := 500 * time.Millisecond
+
+	leaseHeld := make(chan bool, 1)
+	verifyResult := make(chan bool, 1)
+
+	var looper *LeaseLooper
+	looper = NewLeaseLooper(func(ctx context.Context) error {
+		t.Logf("Worker acquired lease %s", leaseName)
+		leaseHeld <- true
+
+		// Acquire a connection and start a transaction to verify the lease is held
+		conn, err := pool.Acquire(ctx)
+		if err != nil {
+			t.Errorf("Failed to acquire connection: %v", err)
+			return err
+		}
+		defer conn.Release()
+
+		txn, err := conn.BeginTx(ctx, pgx.TxOptions{})
+		if err != nil {
+			t.Errorf("Failed to begin transaction: %v", err)
+			return err
+		}
+		defer txn.Rollback(ctx)
+
+		held, err := looper.VerifyLeaseHeld(ctx, txn)
+		if err != nil {
+			t.Errorf("VerifyLeaseHeld failed: %v", err)
+			return err
+		}
+
+		verifyResult <- held
+		t.Logf("VerifyLeaseHeld returned: %v", held)
+
+		// Hold the lease for a bit then return
+		time.Sleep(500 * time.Millisecond)
+		return nil
+	}, "verify-worker", leaseName, pool,
+		Options{
+			LeaseDuration:          leaseDuration,
+			LoopInterval:           loopInterval,
+			LoopIntervalJitter:     time.Duration(0),
+			LeaseHeartbeatInterval: time.Second * 3,
+		})
+
+	go func() {
+		err := looper.Start()
+		if err != nil {
+			t.Errorf("Worker failed to start: %v", err)
+		}
+	}()
+	defer looper.Stop()
+
+	// Wait for lease to be acquired
+	select {
+	case <-leaseHeld:
+		t.Logf("Successfully acquired lease %s", leaseName)
+	case <-time.After(5 * time.Second):
+		t.Fatalf("Failed to acquire lease %s within 5 seconds", leaseName)
+	}
+
+	// Wait for verification result
+	select {
+	case held := <-verifyResult:
+		if !held {
+			t.Errorf("Expected VerifyLeaseHeld to return true when lease is held, got false")
+		} else {
+			t.Logf("VerifyLeaseHeld correctly returned true for held lease")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("VerifyLeaseHeld did not return result within 2 seconds")
 	}
 }
