@@ -2,6 +2,9 @@
 name = "pg_lease"
 version = "0.1.0"
 edition = "2024"
+repository = "https://github.com/danthegoodman1/pg_lease"
+license = "MIT"
+description = "Postgres lease management package for running a single looping function while a lease is held"
 
 [dependencies]
 chrono = { version = "0.4", features = ["serde"] }
