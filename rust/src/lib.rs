@@ -5,6 +5,11 @@ use rand::Rng;
 use sqlx::{Pool, Postgres};
 use tokio::{sync::Mutex, task::AbortHandle};
 
+pub struct LeaseContext {
+    pub lease_name: String,
+    pub worker_id: String,
+}
+
 /// A lease-based looper that ensures only one worker can execute a task at a time
 /// across multiple processes/machines using PostgreSQL as the coordination mechanism.
 ///
@@ -47,7 +52,7 @@ use tokio::{sync::Mutex, task::AbortHandle};
 /// ```
 pub struct LeaseLooper<T, Fut, S>
 where
-    T: Fn(S) -> Fut + Send + Sync + Clone + 'static,
+    T: Fn(LeaseContext, S) -> Fut + Send + Sync + Clone + 'static,
     Fut: Future<Output = Result<(), Box<dyn Error + Send + Sync>>> + Send + 'static,
     S: Clone + Send + Sync + 'static,
 {
@@ -71,7 +76,7 @@ pub struct LeaseLooperOptions {
 
 impl<T, Fut, S> LeaseLooper<T, Fut, S>
 where
-    T: Fn(S) -> Fut + Send + Sync + Clone + 'static,
+    T: Fn(LeaseContext, S) -> Fut + Send + Sync + Clone + 'static,
     Fut: Future<Output = Result<(), Box<dyn Error + Send + Sync>>> + Send + 'static,
     S: Clone + Send + Sync + 'static,
 {
@@ -94,6 +99,7 @@ where
         }
     }
 
+    /// Starts the lease looper, which will poll for a lease and execute the looper function when the lease is acquired.
     pub async fn start(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
         let mut abort_handle = self.abort_handle.lock().await;
 
@@ -148,7 +154,13 @@ where
                 continue;
             }
 
-            let looper_handle = tokio::task::spawn(looper_func(state.clone()));
+            let looper_handle = tokio::task::spawn(looper_func(
+                LeaseContext {
+                    lease_name: lease_name.clone(),
+                    worker_id: worker_id.clone(),
+                },
+                state.clone(),
+            ));
 
             let heartbeat_handle = tokio::task::spawn(Self::heartbeat_loop(
                 looper_handle.abort_handle(),
@@ -333,23 +345,7 @@ where
         Ok(())
     }
 
-    /// Transactionally verifies that the lease is held by the current worker.
-    pub async fn verify_lease_held(
-        &self,
-        tx: &mut sqlx::Transaction<'_, Postgres>,
-    ) -> Result<bool, Box<dyn Error + Send + Sync>> {
-        let result: (String, DateTime<Utc>) = sqlx::query_as(
-            r#"
-            SELECT worker_id, held_until FROM _pg_lease WHERE name = $1 AND worker_id = $2"#,
-        )
-        .bind(self.lease_name.as_str())
-        .bind(self.worker_id.as_str())
-        .fetch_one(&mut **tx)
-        .await?;
-
-        Ok(result.0 == self.worker_id)
-    }
-
+    /// Stops the lease looper, aborting all running tasks.
     pub async fn stop(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
         let mut abort_handle = self.abort_handle.lock().await;
         if let Some(abort_handle) = abort_handle.take() {
@@ -358,6 +354,42 @@ where
 
         Ok(())
     }
+}
+
+/// Transactionally verifies that a lease is held by the specified worker.
+pub async fn verify_lease_held(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    lease_name: &str,
+    worker_id: &str,
+) -> Result<bool, Box<dyn Error + Send + Sync>> {
+    let result: (String, DateTime<Utc>) = sqlx::query_as(
+        r#"
+        SELECT worker_id, held_until FROM _pg_lease WHERE name = $1 AND worker_id = $2"#,
+    )
+    .bind(lease_name)
+    .bind(worker_id)
+    .fetch_one(&mut **tx)
+    .await?;
+
+    Ok(result.0 == worker_id)
+}
+
+/// Force revokes a lease by deleting it from the database regardless of who holds it.
+pub async fn force_revoke_lease(
+    pool: &Pool<Postgres>,
+    lease_name: &str,
+) -> Result<bool, Box<dyn Error + Send + Sync>> {
+    let result = sqlx::query(r#"DELETE FROM _pg_lease WHERE name = $1"#)
+        .bind(lease_name)
+        .execute(pool)
+        .await?;
+
+    let revoked = result.rows_affected() > 0;
+    if revoked {
+        println!("Force revoked lease '{}'", lease_name);
+    }
+
+    Ok(revoked)
 }
 
 #[cfg(test)]
@@ -406,7 +438,7 @@ mod tests {
             let lease_held_tx = lease_held_tx.clone();
             let lease_complete_tx = lease_complete_tx.clone();
             let lease_name = lease_name.clone();
-            move |state: SharedState| {
+            move |_context: LeaseContext, state: SharedState| {
                 let lease_held_tx = lease_held_tx.clone();
                 let lease_complete_tx = lease_complete_tx.clone();
                 let lease_name = lease_name.clone();
@@ -513,7 +545,7 @@ mod tests {
             let worker1_got_tx = worker1_got_tx.clone();
             let worker1_done_tx = worker1_done_tx.clone();
             let lease_name = lease_name.clone();
-            move |_| {
+            move |_, _| {
                 let worker1_got_tx = worker1_got_tx.clone();
                 let worker1_done_tx = worker1_done_tx.clone();
                 let lease_name = lease_name.clone();
@@ -534,7 +566,7 @@ mod tests {
         let worker2_func = {
             let worker2_got_tx = worker2_got_tx.clone();
             let lease_name = lease_name.clone();
-            move |_| {
+            move |_, _| {
                 let worker2_got_tx = worker2_got_tx.clone();
                 let lease_name = lease_name.clone();
                 async move {
@@ -659,7 +691,7 @@ mod tests {
             let verify_result_tx = verify_result_tx.clone();
             let lease_name = lease_name.clone();
             let pool = pool.clone();
-            move |_| {
+            move |_, _| {
                 let lease_held_tx = lease_held_tx.clone();
                 let verify_result_tx = verify_result_tx.clone();
                 let lease_name = lease_name.clone();
@@ -671,17 +703,7 @@ mod tests {
                     // Start a transaction to verify the lease is held
                     let mut tx = pool.begin().await?;
 
-                    // Create a temporary LeaseLooper instance to call verify_lease_held
-                    let temp_looper = LeaseLooper::new(
-                        lease_name.clone(),
-                        |_| async { Ok(()) },
-                        "verify-worker".to_string(),
-                        pool.clone(),
-                        LeaseLooperOptions::default(),
-                        (),
-                    );
-
-                    let held = temp_looper.verify_lease_held(&mut tx).await?;
+                    let held = verify_lease_held(&mut tx, &lease_name, "verify-worker").await?;
                     tx.rollback().await?;
 
                     println!("VerifyLeaseHeld returned: {}", held);
@@ -761,7 +783,7 @@ mod tests {
         let worker1_func = {
             let worker1_got_tx = worker1_got_tx.clone();
             let lease_name = lease_name.clone();
-            move |_| {
+            move |_, _| {
                 let worker1_got_tx = worker1_got_tx.clone();
                 let lease_name = lease_name.clone();
                 async move {
@@ -780,7 +802,7 @@ mod tests {
         let worker2_func = {
             let worker2_got_tx = worker2_got_tx.clone();
             let lease_name = lease_name.clone();
-            move |_| {
+            move |_, _| {
                 let worker2_got_tx = worker2_got_tx.clone();
                 let lease_name = lease_name.clone();
                 async move {
@@ -863,6 +885,103 @@ mod tests {
         println!(
             "Test passed: Worker-2 successfully stole lease from Worker-1 with broken heartbeat"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_force_revoke_lease() -> Result<(), Box<dyn Error + Send + Sync>> {
+        let pool = sqlx::PgPool::connect(TEST_DB_URL).await?;
+
+        let lease_name = format!(
+            "test-force-revoke-{}",
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let lease_duration = Duration::from_secs(5);
+        let loop_interval = Duration::from_millis(200);
+
+        let (lease_held_tx, mut lease_held_rx) = mpsc::channel::<bool>(1);
+
+        let looper_func = {
+            let lease_held_tx = lease_held_tx.clone();
+            let lease_name = lease_name.clone();
+            move |_, _| {
+                let lease_held_tx = lease_held_tx.clone();
+                let lease_name = lease_name.clone();
+                async move {
+                    println!("Worker acquired lease {}", lease_name);
+                    let _ = lease_held_tx.send(true).await;
+
+                    // Hold the lease until cancelled (by force revoke)
+                    loop {
+                        sleep(Duration::from_millis(100)).await;
+                    }
+                }
+            }
+        };
+
+        let options = LeaseLooperOptions {
+            loop_interval,
+            loop_interval_jitter: Duration::from_secs(0),
+            lease_duration,
+            lease_heartbeat_interval: Duration::from_millis(500),
+        };
+
+        let looper = LeaseLooper::new(
+            lease_name.clone(),
+            looper_func,
+            "force-revoke-worker".to_string(),
+            pool.clone(),
+            options,
+            (),
+        );
+
+        // Start the looper
+        looper.start().await?;
+
+        // Wait for lease to be acquired
+        let lease_acquired = timeout(Duration::from_secs(5), lease_held_rx.recv()).await;
+        match lease_acquired {
+            Ok(Some(true)) => println!("Successfully acquired lease {}", lease_name),
+            _ => {
+                looper.stop().await?;
+                panic!("Failed to acquire lease {} within 5 seconds", lease_name);
+            }
+        }
+
+        // Give the worker a moment to establish the lease
+        sleep(Duration::from_millis(100)).await;
+
+        // Force revoke the lease
+        let revoked = force_revoke_lease(&pool, &lease_name).await?;
+        if !revoked {
+            looper.stop().await?;
+            panic!("Expected force_revoke_lease to return true, got false");
+        }
+        println!("Successfully force-revoked lease {}", lease_name);
+
+        // Try to revoke the same lease again - should return false since it doesn't exist
+        let revoked_again = force_revoke_lease(&pool, &lease_name).await?;
+        if revoked_again {
+            looper.stop().await?;
+            panic!(
+                "Expected second force_revoke_lease to return false for non-existent lease, got true"
+            );
+        }
+        println!("Correctly returned false when trying to revoke non-existent lease");
+
+        // Try to revoke a completely non-existent lease
+        let fake_lease_name = format!("{}-nonexistent", lease_name);
+        let revoked_fake = force_revoke_lease(&pool, &fake_lease_name).await?;
+        if revoked_fake {
+            looper.stop().await?;
+            panic!("Expected force_revoke_lease on fake lease to return false, got true");
+        }
+        println!("Correctly returned false when trying to revoke completely fake lease");
+
+        looper.stop().await?;
         Ok(())
     }
 }
