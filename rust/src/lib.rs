@@ -166,10 +166,12 @@ where
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         println!("attempting to acquire lease: {}", worker_id);
 
-        let sleep_duration = options.loop_interval
-            + Duration::from_millis(
-                rand::rng().random_range(0..options.loop_interval_jitter.as_millis()) as u64,
-            );
+        let jitter_millis = if options.loop_interval_jitter.as_millis() > 0 {
+            rand::rng().random_range(0..options.loop_interval_jitter.as_millis()) as u64
+        } else {
+            0
+        };
+        let sleep_duration = options.loop_interval + Duration::from_millis(jitter_millis);
 
         loop {
             match Self::try_acquire_lease(pool, lease_name, worker_id, options).await {
@@ -313,4 +315,98 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::time::SystemTime;
+    use tokio::sync::mpsc;
+    use tokio::time::{sleep, timeout};
+
+    const TEST_DB_URL: &str = "postgres://postgres:postgres@localhost:5432/postgres";
+
+    #[tokio::test]
+    async fn test_lease_heartbeat() -> Result<(), Box<dyn Error + Send + Sync>> {
+        let pool = sqlx::PgPool::connect(TEST_DB_URL).await?;
+
+        let lease_name = format!(
+            "test-lease-heartbeat-{}",
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let lease_duration = Duration::from_secs(2);
+        let loop_interval = Duration::from_millis(500);
+
+        let (lease_held_tx, mut lease_held_rx) = mpsc::channel::<bool>(1);
+        let (lease_complete_tx, mut lease_complete_rx) = mpsc::channel::<bool>(1);
+
+        let lease_held_tx = Arc::new(tokio::sync::Mutex::new(Some(lease_held_tx)));
+        let lease_complete_tx = Arc::new(tokio::sync::Mutex::new(Some(lease_complete_tx)));
+
+        let looper_func = {
+            let lease_held_tx = lease_held_tx.clone();
+            let lease_complete_tx = lease_complete_tx.clone();
+            let lease_name = lease_name.clone();
+            move || {
+                let lease_held_tx = lease_held_tx.clone();
+                let lease_complete_tx = lease_complete_tx.clone();
+                let lease_name = lease_name.clone();
+                async move {
+                    println!("Worker acquired lease {}", lease_name);
+
+                    if let Some(tx) = lease_held_tx.lock().await.take() {
+                        let _ = tx.send(true).await;
+                    }
+
+                    // Keep the lease for 2x the lease duration to test heartbeating
+                    sleep(2 * lease_duration).await;
+                    println!("Worker held lease for 2x duration, returning");
+
+                    if let Some(tx) = lease_complete_tx.lock().await.take() {
+                        let _ = tx.send(true).await;
+                    }
+
+                    Ok(())
+                }
+            }
+        };
+
+        let options = LeaseLooperOptions {
+            loop_interval,
+            loop_interval_jitter: Duration::from_secs(0),
+            lease_duration,
+            lease_heartbeat_interval: Duration::from_millis(500), // Much shorter than lease duration
+        };
+
+        let looper = LeaseLooper::new(
+            lease_name.clone(),
+            looper_func,
+            "heartbeat-worker".to_string(),
+            pool.clone(),
+            options,
+        );
+
+        // Start the looper
+        looper.start().await?;
+
+        // Wait for lease to be acquired
+        let lease_acquired = timeout(Duration::from_secs(5), lease_held_rx.recv()).await;
+        match lease_acquired {
+            Ok(Some(true)) => println!("Successfully acquired lease {}", lease_name),
+            _ => panic!("Failed to acquire lease {} within 5 seconds", lease_name),
+        }
+
+        // Wait for the worker to complete its 4-second hold
+        let lease_completed = timeout(Duration::from_secs(6), lease_complete_rx.recv()).await;
+        match lease_completed {
+            Ok(Some(true)) => {
+                println!("Successfully held lease for 2x duration via heartbeating");
+                looper.stop().await?;
+                Ok(())
+            }
+            _ => {
+                looper.stop().await?;
+                panic!("Worker did not complete 4-second hold - heartbeating may have failed");
+            }
+        }
+    }
 }
