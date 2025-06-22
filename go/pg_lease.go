@@ -49,18 +49,18 @@ func NewLeaseLooper(looperFunc LeaseLooperFunc, workerID string, leaseName strin
 	return looper
 }
 
-func (looper *LeaseLooper) Start() {
+func (looper *LeaseLooper) Start() error {
 	ctx, cancel := context.WithCancel(context.Background())
 	looper.cancelFunc = cancel
 
-	go looper.launch(ctx)
+	return looper.launch(ctx)
 }
 
 func (looper *LeaseLooper) Stop() {
 	looper.cancelFunc()
 }
 
-func (looper *LeaseLooper) launch(ctx context.Context) {
+func (looper *LeaseLooper) launch(ctx context.Context) error {
 	fmt.Println("launched lease looper, attempting to create table", looper.workerID)
 
 	// create the table if not exists
@@ -68,8 +68,7 @@ func (looper *LeaseLooper) launch(ctx context.Context) {
 	defer cancel()
 	conn, err := looper.pool.Acquire(timeoutCtx)
 	if err != nil {
-		fmt.Println("[ERR] error acquiring connection for table creation:", err.Error())
-		return
+		return fmt.Errorf("error acquiring connection for table creation: %w", err)
 	}
 	_, err = conn.Exec(timeoutCtx, `create table if not exists _pg_lease (
     name text,
@@ -79,8 +78,7 @@ func (looper *LeaseLooper) launch(ctx context.Context) {
 )`)
 	conn.Release()
 	if err != nil {
-		fmt.Println("[ERR]", fmt.Errorf("error creating _pg_lease table %s: %w - aborting", looper.workerID, err))
-		return
+		return fmt.Errorf("error creating _pg_lease table %s: %w - aborting", looper.workerID, err)
 	}
 
 	for {
@@ -91,7 +89,7 @@ func (looper *LeaseLooper) launch(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			fmt.Println("context done, exiting")
-			return
+			return nil
 		case <-acquireChan:
 			fmt.Println("acquired lease, starting lease loop")
 		}
@@ -99,10 +97,12 @@ func (looper *LeaseLooper) launch(ctx context.Context) {
 		err = looper.leaseHandler(ctx)
 		if err == nil {
 			fmt.Println("LeaseLooperFunc returned, dropping lease")
+			return nil
 		} else if errors.Is(err, context.Canceled) {
 			fmt.Println("context canceled, exiting")
+			return nil
 		} else {
-			fmt.Println("[ERR] leaseHandler returned an error:", err.Error())
+			return fmt.Errorf("leaseHandler returned an error: %w", err)
 		}
 	}
 }

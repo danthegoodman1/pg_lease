@@ -43,7 +43,12 @@ func TestLeaseHeartbeat(t *testing.T) {
 		WithLeaseDuration(leaseDuration),
 		WithLoopInterval(loopInterval))
 
-	looper.Start()
+	go func() {
+		err := looper.Start()
+		if err != nil {
+			t.Errorf("Worker failed to start: %v", err)
+		}
+	}()
 	defer looper.Stop()
 
 	// Wait for lease to be acquired
@@ -101,7 +106,12 @@ func TestLeaseDropOnReturn(t *testing.T) {
 		WithLoopInterval(loopInterval))
 
 	// Start worker 1 first
-	looper1.Start()
+	go func() {
+		err := looper1.Start()
+		if err != nil {
+			t.Errorf("Worker-1 failed to start: %v", err)
+		}
+	}()
 
 	// Wait for worker 1 to get the lease
 	select {
@@ -118,7 +128,12 @@ func TestLeaseDropOnReturn(t *testing.T) {
 
 	// Now start worker 2
 	t.Logf("Starting worker 2")
-	looper2.Start()
+	go func() {
+		err := looper2.Start()
+		if err != nil {
+			t.Errorf("Worker-2 failed to start: %v", err)
+		}
+	}()
 	defer looper2.Stop()
 
 	// Wait for worker 1 to finish and then stop it
