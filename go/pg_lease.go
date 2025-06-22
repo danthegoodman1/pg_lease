@@ -7,6 +7,7 @@ import (
 	"math/rand"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -251,9 +252,12 @@ func VerifyLeaseHeld(ctx context.Context, txn pgxpool.Tx, looper *LeaseLooper) (
 		WHERE name = $1 AND worker_id = $2 AND held_until > NOW()`,
 		looper.leaseName, looper.workerID).Scan(&resultWorkerID)
 
-	if err != nil {
+	if errors.Is(err, pgx.ErrNoRows) {
 		// No rows found means we don't hold the lease
 		return false, nil
+	}
+	if err != nil {
+		return false, err
 	}
 
 	return resultWorkerID == looper.workerID, nil
