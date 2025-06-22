@@ -4,6 +4,8 @@ Go and Rust package for Postgres lease management package for running a single l
 
 This is a great building block for distributed systems that need a simple mechanism to coordinate ownership of partitions via a single process making decisions. This can then be integrated with `VerifyLeaseHeld` to transactionally verify that the lease is still held when making updates.
 
+Downstream dependencies (e.g. partitions) would asynchornously receive updates and use transactional methods to verify they own the partition when doing some operation (e.g. writing log segment metadata to postgres as the metadata store).
+
 ## Architecture
 
 With the current design, if a worker dies and then restarts, it can actually recover its lease before the timeout!
