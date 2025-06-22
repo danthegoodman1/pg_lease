@@ -200,11 +200,10 @@ func (looper *LeaseLooper) leaseHandler(ctx context.Context) error {
 // launchHeartbeatLoop runs in a background goroutine to renew the lease periodically
 func (looper *LeaseLooper) launchHeartbeatLoop(ctx context.Context, cancel context.CancelFunc) {
 	for {
-		sleepDuration := looper.options.LoopInterval + time.Duration(rand.Int63n(int64(looper.options.LoopIntervalJitter)))
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(sleepDuration):
+		case <-time.After(looper.options.LeaseHeartbeatInterval):
 			if !looper.renewLease(ctx) {
 				cancel() // Lost the lease, cancel the context
 				return

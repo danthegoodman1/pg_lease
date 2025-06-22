@@ -45,7 +45,7 @@ func TestLeaseHeartbeat(t *testing.T) {
 			LeaseDuration:          leaseDuration,
 			LoopInterval:           loopInterval,
 			LoopIntervalJitter:     time.Duration(0),
-			LeaseHeartbeatInterval: time.Second * 3,
+			LeaseHeartbeatInterval: time.Millisecond * 500,
 		})
 
 	go func() {
@@ -101,7 +101,7 @@ func TestLeaseDropOnReturn(t *testing.T) {
 			LeaseDuration:          leaseDuration,
 			LoopInterval:           loopInterval,
 			LoopIntervalJitter:     time.Duration(0),
-			LeaseHeartbeatInterval: time.Second * 3,
+			LeaseHeartbeatInterval: time.Second * 1,
 		})
 
 	// Worker 2: Waits to get the lease
@@ -115,7 +115,7 @@ func TestLeaseDropOnReturn(t *testing.T) {
 			LeaseDuration:          leaseDuration,
 			LoopInterval:           loopInterval,
 			LoopIntervalJitter:     time.Duration(0),
-			LeaseHeartbeatInterval: time.Second * 3,
+			LeaseHeartbeatInterval: time.Second * 1,
 		})
 
 	// Start worker 1 first
@@ -221,7 +221,7 @@ func TestVerifyLeaseHeld(t *testing.T) {
 			LeaseDuration:          leaseDuration,
 			LoopInterval:           loopInterval,
 			LoopIntervalJitter:     time.Duration(0),
-			LeaseHeartbeatInterval: time.Second * 3,
+			LeaseHeartbeatInterval: time.Millisecond * 500,
 		})
 
 	go func() {
@@ -250,5 +250,94 @@ func TestVerifyLeaseHeld(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatalf("VerifyLeaseHeld did not return result within 2 seconds")
+	}
+}
+
+func TestLeaseHeartbeatFailure(t *testing.T) {
+	pool, err := pgxpool.New(context.Background(), testDBURL)
+	if err != nil {
+		t.Fatalf("Failed to connect to database: %v", err)
+	}
+	defer pool.Close()
+
+	leaseName := fmt.Sprintf("test-lease-heartbeat-fail-%d", time.Now().UnixNano())
+	leaseDuration := 800 * time.Millisecond // Short lease duration
+	loopInterval := 100 * time.Millisecond
+
+	worker1Got := make(chan bool, 1)
+	worker1Lost := make(chan bool, 1)
+	worker2Got := make(chan bool, 1)
+
+	// Worker 1: Has broken heartbeat (too long interval)
+	looper1 := NewLeaseLooper(func(ctx context.Context) error {
+		t.Logf("Worker-1 acquired lease %s", leaseName)
+		worker1Got <- true
+
+		// Wait for context cancellation due to lost lease
+		<-ctx.Done()
+		t.Logf("Worker-1 lost lease as expected due to failed heartbeating")
+		worker1Lost <- true
+		return ctx.Err()
+	}, "worker-1", leaseName, pool,
+		Options{
+			LeaseDuration:          leaseDuration,
+			LoopInterval:           loopInterval,
+			LoopIntervalJitter:     time.Duration(0),
+			LeaseHeartbeatInterval: time.Second * 2, // Much longer than lease duration - should fail
+		})
+
+	// Worker 2: Has proper heartbeat to steal the lease
+	looper2 := NewLeaseLooper(func(ctx context.Context) error {
+		t.Logf("Worker-2 acquired lease %s", leaseName)
+		worker2Got <- true
+		<-ctx.Done() // Hold until stopped
+		return ctx.Err()
+	}, "worker-2", leaseName, pool,
+		Options{
+			LeaseDuration:          leaseDuration,
+			LoopInterval:           loopInterval,
+			LoopIntervalJitter:     time.Duration(0),
+			LeaseHeartbeatInterval: time.Millisecond * 200, // Proper heartbeat interval
+		})
+
+	// Start worker 1 first
+	go func() {
+		err := looper1.Start()
+		if err != nil {
+			t.Logf("Worker-1 stopped: %v", err)
+		}
+	}()
+
+	// Wait for worker 1 to get the lease
+	select {
+	case <-worker1Got:
+		t.Logf("Worker-1 acquired lease")
+	case <-time.After(5 * time.Second):
+		t.Fatalf("Worker-1 failed to acquire lease within 5 seconds")
+	}
+
+	// Start worker 2 which should steal the lease
+	go func() {
+		err := looper2.Start()
+		if err != nil {
+			t.Logf("Worker-2 stopped: %v", err)
+		}
+	}()
+	defer looper2.Stop()
+
+	// Wait for worker 2 to steal the lease
+	select {
+	case <-worker2Got:
+		t.Logf("Worker-2 stole the lease")
+	case <-time.After(3 * time.Second):
+		t.Fatalf("Worker-2 should have stolen the lease within 3 seconds")
+	}
+
+	// Wait for worker 1 to lose the lease
+	select {
+	case <-worker1Lost:
+		t.Logf("Test passed: Worker-1 lost lease due to failed heartbeating")
+	case <-time.After(2 * time.Second):
+		t.Fatalf("Worker-1 should have lost lease within 2 seconds after worker-2 acquired it")
 	}
 }

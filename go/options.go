@@ -14,6 +14,6 @@ func DefaultOptions() *Options {
 		LoopInterval:           time.Second,
 		LoopIntervalJitter:     time.Duration(0),
 		LeaseDuration:          time.Second * 10,
-		LeaseHeartbeatInterval: time.Second * 3,
+		LeaseHeartbeatInterval: time.Second * 2,
 	}
 }
