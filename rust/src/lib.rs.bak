@@ -1,0 +1,376 @@
+use std::{error::Error, future::Future, sync::Arc, time::Duration};
+
+use chrono::{DateTime, Utc};
+use rand::Rng;
+use sqlx::{Pool, Postgres, Row};
+use tokio::{sync::Mutex, task::AbortHandle};
+use tokio_util::sync::CancellationToken;
+
+pub struct LeaseLooper<T, Fut>
+where
+    T: Fn(CancellationToken) -> Fut + Send + Sync + Clone + 'static,
+    Fut: Future<Output = Result<(), Box<dyn Error + Send + Sync>>> + Send + 'static,
+{
+    lease_name: String,
+    worker_id: String,
+    looper_func: T,
+    options: LeaseLooperOptions,
+    pool: Pool<Postgres>,
+
+    abort_handle: Arc<Mutex<Option<AbortHandle>>>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LeaseLooperOptions {
+    pub loop_interval: Duration,
+    pub loop_interval_jitter: Duration,
+    pub lease_duration: Duration,
+}
+
+impl<T, Fut> LeaseLooper<T, Fut>
+where
+    T: Fn(CancellationToken) -> Fut + Send + Sync + Clone + 'static,
+    Fut: Future<Output = Result<(), Box<dyn Error + Send + Sync>>> + Send + 'static,
+{
+    pub fn new(
+        lease_name: String,
+        looper_func: T,
+        worker_id: String,
+        pool: Pool<Postgres>,
+        options: LeaseLooperOptions,
+    ) -> Self {
+        Self {
+            lease_name,
+            worker_id,
+            looper_func,
+            options,
+            pool,
+            abort_handle: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    pub async fn start(&self) -> Result<(), Box<dyn Error>> {
+        let mut abort_handle = self.abort_handle.lock().await;
+
+        let join_handle = tokio::task::spawn(Self::launch_looper(
+            self.lease_name.clone(),
+            self.looper_func.clone(),
+            self.pool.clone(),
+            self.options,
+            self.worker_id.clone(),
+        ));
+
+        *abort_handle = Some(join_handle.abort_handle());
+
+        Ok(())
+    }
+
+    async fn launch_looper(
+        lease_name: String,
+        looper_func: T,
+        pool: Pool<Postgres>,
+        options: LeaseLooperOptions,
+        worker_id: String,
+    ) {
+        println!(
+            "launched lease looper, attempting to create table {}",
+            worker_id
+        );
+
+        // Create the table if not exists
+        if let Err(e) = sqlx::query(
+            r#"
+            create table if not exists _pg_lease (
+                name text,
+                worker_id text,
+                held_until timestamptz,
+                primary key (name)
+            )"#,
+        )
+        .execute(&pool)
+        .await
+        {
+            println!(
+                "error creating _pg_lease table {}: {} - aborting",
+                worker_id, e
+            );
+            return;
+        }
+
+        let main_cancel_token = CancellationToken::new();
+
+        loop {
+            // Wait to acquire the lease
+            Self::wait_for_lease(&pool, &lease_name, &worker_id, &options, &main_cancel_token)
+                .await;
+
+            if main_cancel_token.is_cancelled() {
+                println!("context canceled, exiting");
+                return;
+            }
+
+            println!("acquired lease, starting lease loop");
+
+            // We have the lease, start the lease handler
+            match Self::lease_handler(
+                &pool,
+                &lease_name,
+                &worker_id,
+                &options,
+                &looper_func,
+                &main_cancel_token,
+            )
+            .await
+            {
+                Ok(()) => {
+                    println!("LeaseLooperFunc returned, dropping lease");
+                    Self::drop_lease(&pool, &lease_name, &worker_id).await;
+                    return;
+                }
+                Err(e) if e.to_string().contains("cancelled") => {
+                    println!("context canceled, exiting");
+                    return;
+                }
+                Err(e) => {
+                    println!("leaseHandler returned an error: {}", e);
+                    return;
+                }
+            }
+        }
+    }
+
+    async fn wait_for_lease(
+        pool: &Pool<Postgres>,
+        lease_name: &str,
+        worker_id: &str,
+        options: &LeaseLooperOptions,
+        cancel_token: &CancellationToken,
+    ) {
+        println!("attempting to acquire lease: {}", worker_id);
+
+        loop {
+            if cancel_token.is_cancelled() {
+                println!("context canceled in wait_for_lease, exiting {}", worker_id);
+                return;
+            }
+
+            let acquired = Self::try_acquire_lease(pool, lease_name, worker_id, options)
+                .await
+                .unwrap_or(false);
+
+            if acquired {
+                break;
+            }
+
+            let sleep_duration = options.loop_interval
+                + Duration::from_millis(
+                    rand::rng().random_range(0..options.loop_interval_jitter.as_millis()) as u64,
+                );
+
+            println!("sleeping for: {:?} {}", sleep_duration, worker_id);
+
+            tokio::select! {
+                _ = cancel_token.cancelled() => {
+                    println!("context canceled in wait_for_lease, exiting {}", worker_id);
+                    return;
+                }
+                _ = tokio::time::sleep(sleep_duration) => {
+                    // Continue to next iteration
+                }
+            }
+        }
+    }
+
+    async fn try_acquire_lease(
+        pool: &Pool<Postgres>,
+        lease_name: &str,
+        worker_id: &str,
+        options: &LeaseLooperOptions,
+    ) -> Result<bool, Box<dyn Error>> {
+        let result = sqlx::query(
+            r#"
+            INSERT INTO _pg_lease (name, worker_id, held_until)
+            VALUES ($1, $2, NOW() + $3::interval)
+            ON CONFLICT (name) DO UPDATE SET
+                worker_id = CASE
+                    WHEN _pg_lease.held_until < NOW() THEN $2
+                    ELSE _pg_lease.worker_id
+                END,
+                held_until = CASE
+                    WHEN _pg_lease.held_until < NOW() THEN NOW() + $3::interval
+                    ELSE _pg_lease.held_until
+                END
+            RETURNING worker_id, held_until"#,
+        )
+        .bind(lease_name)
+        .bind(worker_id)
+        .bind(options.lease_duration)
+        .fetch_one(pool)
+        .await?;
+
+        let result_worker_id: String = result.get("worker_id");
+        let result_held_until: DateTime<Utc> = result.get("held_until");
+
+        if result_worker_id == worker_id {
+            println!("successfully acquired lease: {}", worker_id);
+            Ok(true)
+        } else {
+            println!(
+                "lease held by another worker: {} until: {} {}",
+                result_worker_id, result_held_until, worker_id
+            );
+            Ok(false)
+        }
+    }
+
+    async fn lease_handler(
+        pool: &Pool<Postgres>,
+        lease_name: &str,
+        worker_id: &str,
+        options: &LeaseLooperOptions,
+        looper_func: &T,
+        main_cancel_token: &CancellationToken,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        // Create a cancellation token just for the looper function
+        let lease_cancel_token = CancellationToken::new();
+
+        // Start the heartbeat loop
+        let heartbeat_handle = tokio::task::spawn(Self::heartbeat_loop(
+            pool.clone(),
+            lease_name.to_string(),
+            worker_id.to_string(),
+            *options,
+            lease_cancel_token.clone(),
+        ));
+
+        // Start the looper function
+        let looper_result = tokio::select! {
+            result = looper_func(lease_cancel_token.clone()) => result,
+            _ = main_cancel_token.cancelled() => {
+                lease_cancel_token.cancel();
+                return Err("main context cancelled".into());
+            }
+            _ = lease_cancel_token.cancelled() => {
+                return Err("lease lost".into());
+            }
+        };
+
+        // Clean up
+        lease_cancel_token.cancel();
+        heartbeat_handle.abort();
+
+        looper_result
+    }
+
+    async fn heartbeat_loop(
+        pool: Pool<Postgres>,
+        lease_name: String,
+        worker_id: String,
+        options: LeaseLooperOptions,
+        cancel_token: CancellationToken,
+    ) {
+        loop {
+            let sleep_duration = options.loop_interval
+                + Duration::from_millis(
+                    rand::rng().random_range(0..options.loop_interval_jitter.as_millis()) as u64,
+                );
+
+            tokio::select! {
+                _ = cancel_token.cancelled() => {
+                    return;
+                }
+                _ = tokio::time::sleep(sleep_duration) => {
+                    if !Self::renew_lease(&pool, &lease_name, &worker_id, &options).await {
+                        cancel_token.cancel(); // Lost the lease, cancel everything
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    async fn renew_lease(
+        pool: &Pool<Postgres>,
+        lease_name: &str,
+        worker_id: &str,
+        options: &LeaseLooperOptions,
+    ) -> bool {
+        let result = sqlx::query(
+            r#"
+            UPDATE _pg_lease
+            SET held_until = NOW() + $3::interval
+            WHERE name = $1 AND worker_id = $2 AND held_until > NOW()
+            RETURNING worker_id"#,
+        )
+        .bind(lease_name)
+        .bind(worker_id)
+        .bind(options.lease_duration)
+        .fetch_optional(pool)
+        .await;
+
+        match result {
+            Ok(Some(row)) => {
+                let result_worker_id: String = row.get("worker_id");
+                result_worker_id == worker_id
+            }
+            _ => {
+                println!("lost lease during heartbeat {}", worker_id);
+                false
+            }
+        }
+    }
+
+    async fn drop_lease(pool: &Pool<Postgres>, lease_name: &str, worker_id: &str) {
+        match sqlx::query(
+            r#"
+            DELETE FROM _pg_lease
+            WHERE name = $1 AND worker_id = $2"#,
+        )
+        .bind(lease_name)
+        .bind(worker_id)
+        .execute(pool)
+        .await
+        {
+            Ok(_) => println!("successfully dropped lease {}", worker_id),
+            Err(e) => println!("error dropping lease: {} {}", e, worker_id),
+        }
+    }
+
+    pub async fn verify_lease_held<'a>(
+        &self,
+        txn: &mut sqlx::Transaction<'a, Postgres>,
+    ) -> Result<bool, Box<dyn Error>> {
+        let result = sqlx::query(
+            r#"
+            SELECT worker_id
+            FROM _pg_lease
+            WHERE name = $1 AND worker_id = $2 AND held_until > NOW()"#,
+        )
+        .bind(&self.lease_name)
+        .bind(&self.worker_id)
+        .fetch_optional(&mut **txn)
+        .await?;
+
+        match result {
+            Some(row) => {
+                let result_worker_id: String = row.get("worker_id");
+                Ok(result_worker_id == self.worker_id)
+            }
+            None => Ok(false),
+        }
+    }
+
+    pub async fn stop(&self) -> Result<(), Box<dyn Error>> {
+        let mut abort_handle = self.abort_handle.lock().await;
+        if let Some(abort_handle) = abort_handle.take() {
+            abort_handle.abort();
+        }
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+}

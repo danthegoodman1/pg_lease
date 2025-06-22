@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+chrono = { version = "0.4", features = ["serde"] }
 rand = "0.9.1"
-sqlx = { version = "0.8.6", features = ["postgres"] }
+sqlx = { version = "0.8.6", features = ["postgres", "chrono"] }
 tokio = { version = "1.45.1", features = ["full"] }
+tokio-util = "0.7.15"
