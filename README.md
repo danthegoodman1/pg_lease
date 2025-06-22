@@ -2,9 +2,11 @@
 
 Go and Rust package for Postgres lease management package for running a single looping function while a lease is held.
 
-With the current design, if a worker dies and then restarts, it can actually recover its lease before the timeout!
+This is a great building block for distributed systems that need a simple mechanism to coordinate ownership of partitions via a single process making decisions. This can then be integrated with `VerifyLeaseHeld` to transactionally verify that the lease is still held when making updates.
 
 ## Architecture
+
+With the current design, if a worker dies and then restarts, it can actually recover its lease before the timeout!
 
 ### Not using LISTEN/NOTIFY
 

@@ -250,7 +250,7 @@ func (looper *LeaseLooper) renewLease(ctx context.Context) bool {
 }
 
 // VerifyLeaseHeld will transactionally verify that a lease is still held
-func VerifyLeaseHeld(ctx context.Context, txn pgxpool.Tx, looper *LeaseLooper) (bool, error) {
+func (looper *LeaseLooper) VerifyLeaseHeld(ctx context.Context, txn pgxpool.Tx) (bool, error) {
 	var resultWorkerID string
 	err := txn.QueryRow(ctx, `
 		SELECT worker_id
