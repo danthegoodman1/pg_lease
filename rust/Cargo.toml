@@ -6,7 +6,7 @@ repository = "https://github.com/danthegoodman1/pg_lease"
 license = "MIT"
 description = "Postgres lease management package for running a single looping function while a lease is held"
 documentation = "https://docs.rs/pg_lease"
-readme = "README.md"
+readme = "../README.md"
 
 [dependencies]
 chrono = { version = "0.4", features = ["serde"] }
