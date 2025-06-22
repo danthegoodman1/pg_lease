@@ -333,6 +333,7 @@ where
         Ok(())
     }
 
+    /// Transactionally verifies that the lease is held by the current worker.
     pub async fn verify_lease_held(
         &self,
         tx: &mut sqlx::Transaction<'_, Postgres>,
