@@ -666,17 +666,14 @@ mod tests {
         let loop_interval = Duration::from_millis(100);
 
         let (worker1_got_tx, mut worker1_got_rx) = mpsc::channel::<bool>(1);
-        let (worker1_lost_tx, mut worker1_lost_rx) = mpsc::channel::<bool>(1);
         let (worker2_got_tx, mut worker2_got_rx) = mpsc::channel::<bool>(1);
 
         // Worker 1: Has broken heartbeat (too long interval)
         let worker1_func = {
             let worker1_got_tx = worker1_got_tx.clone();
-            let worker1_lost_tx = worker1_lost_tx.clone();
             let lease_name = lease_name.clone();
             move || {
                 let worker1_got_tx = worker1_got_tx.clone();
-                let worker1_lost_tx = worker1_lost_tx.clone();
                 let lease_name = lease_name.clone();
                 async move {
                     println!("Worker-1 acquired lease {}", lease_name);
