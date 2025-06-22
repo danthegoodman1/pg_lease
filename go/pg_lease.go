@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -63,6 +65,20 @@ func (looper *LeaseLooper) launch(ctx context.Context) {
 
 	fmt.Println("acquired pool connection, attempting to acquire lease", looper.workerID)
 
+	// create the table if not exists
+	timeoutCtx, cancel := context.WithTimeout(ctx, time.Second*10)
+	defer cancel()
+	_, err = conn.Exec(timeoutCtx, `create table if not exists _pg_lease (
+    name text,
+    worker_id text,
+    held_until timestamptz,
+    primary key (name)
+)`, looper.leaseName)
+	if err != nil {
+		fmt.Println("[ERR]", fmt.Errorf("error creating _pg_lease table %s: %w - aborting", looper.workerID, err))
+		return
+	}
+
 	for {
 		looper.leaseID = ""              // clear lease id
 		acquireChan := make(chan string) // the lease ID
@@ -92,7 +108,62 @@ func (looper *LeaseLooper) launch(ctx context.Context) {
 func (looper *LeaseLooper) acquireLease(ctx context.Context, conn *pgxpool.Conn, acquireChan chan string) {
 	fmt.Println("attempting to acquire lease", looper.workerID)
 	for {
-		select {}
+		sleepDuration := looper.options.loopInterval + time.Duration(rand.Int63n(int64(looper.options.loopIntervalJitter)))
+		fmt.Println("sleeping for", sleepDuration, looper.workerID)
+		select {
+		case <-ctx.Done():
+			fmt.Println("context canceled in acquireLease, exiting", looper.workerID)
+		case <-time.After(sleepDuration):
+			// Try to acquire the lease
+			tx, err := conn.Begin(ctx)
+			if err != nil {
+				fmt.Println("[ERR]", fmt.Errorf("error in conn.Begin %s: %w", looper.workerID, err))
+				return
+			}
+
+			// Try to insert the lease record if the record doesn't exist, or if it's expired
+			var resultWorkerID string
+			var resultHeldUntil time.Time
+			err = tx.QueryRow(ctx, `
+				INSERT INTO _pg_lease (name, worker_id, held_until)
+				VALUES ($1, $2, NOW() + $3::interval)
+				ON CONFLICT (name) DO UPDATE SET
+					worker_id = CASE
+						WHEN _pg_lease.held_until < NOW() THEN $2
+						ELSE _pg_lease.worker_id
+					END,
+					held_until = CASE
+						WHEN _pg_lease.held_until < NOW() THEN NOW() + $3::interval
+						ELSE _pg_lease.held_until
+					END
+				RETURNING worker_id, held_until`,
+				looper.leaseName, looper.workerID, looper.options.leaseDuration).Scan(&resultWorkerID, &resultHeldUntil)
+
+			if err != nil {
+				fmt.Println("[ERR]", fmt.Errorf("error in lease query %s: %w", looper.workerID, err))
+				tx.Rollback(ctx)
+				continue
+			}
+
+			// Check if we successfully acquired the lease
+			if resultWorkerID == looper.workerID {
+				err = tx.Commit(ctx)
+				if err != nil {
+					fmt.Println("[ERR]", fmt.Errorf("error committing lease transaction %s: %w", looper.workerID, err))
+					continue
+				}
+
+				// Generate a unique lease ID for this acquisition
+				leaseID := fmt.Sprintf("%s-%d", looper.workerID, rand.Int63())
+				fmt.Println("successfully acquired lease", looper.workerID, "lease ID:", leaseID)
+				acquireChan <- leaseID
+				return
+			} else {
+				// Someone else holds the lease and it's not expired
+				tx.Rollback(ctx)
+				fmt.Println("lease held by another worker:", resultWorkerID, "until:", resultHeldUntil, looper.workerID)
+			}
+		}
 	}
 }
 
