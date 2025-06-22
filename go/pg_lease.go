@@ -244,5 +244,17 @@ func (looper *LeaseLooper) renewLease(ctx context.Context) bool {
 
 // VerifyLeaseHeld will transactionally verify that a lease is still held
 func VerifyLeaseHeld(ctx context.Context, txn pgxpool.Tx, looper *LeaseLooper) (bool, error) {
-	panic("todo")
+	var resultWorkerID string
+	err := txn.QueryRow(ctx, `
+		SELECT worker_id
+		FROM _pg_lease
+		WHERE name = $1 AND worker_id = $2 AND held_until > NOW()`,
+		looper.leaseName, looper.workerID).Scan(&resultWorkerID)
+
+	if err != nil {
+		// No rows found means we don't hold the lease
+		return false, nil
+	}
+
+	return resultWorkerID == looper.workerID, nil
 }
