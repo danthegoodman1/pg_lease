@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -80,7 +81,13 @@ func (looper *LeaseLooper) launch(ctx context.Context) error {
 )`)
 	conn.Release()
 	if err != nil {
-		return fmt.Errorf("error creating _pg_lease table %s: %w - aborting", looper.workerID, err)
+		// Handle race condition where multiple processes try to create the table simultaneously
+		if strings.Contains(err.Error(), "duplicate key value violates unique constraint \"pg_type_typname_nsp_index\"") {
+			// This is a race condition - another process already created the table/type, which is fine
+			fmt.Println("Table _pg_lease already exists (race condition handled)")
+		} else {
+			return fmt.Errorf("error creating _pg_lease table %s: %w - aborting", looper.workerID, err)
+		}
 	}
 
 	for {

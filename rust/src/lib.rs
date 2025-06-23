@@ -139,8 +139,17 @@ where
         .execute(&pool)
         .await
         {
-            eprintln!("Failed to create _pg_lease table for {}: {}", worker_id, e);
-            return Err(format!("Failed to create _pg_lease table: {}", e).into());
+            // Handle race condition where multiple tests try to create the table simultaneously
+            let error_msg = e.to_string();
+            if error_msg.contains(
+                "duplicate key value violates unique constraint \"pg_type_typname_nsp_index\"",
+            ) {
+                // This is a race condition - another test already created the table/type, which is fine
+                println!("Table _pg_lease already exists (race condition handled)");
+            } else {
+                eprintln!("Failed to create _pg_lease table for {}: {}", worker_id, e);
+                return Err(format!("Failed to create _pg_lease table: {}", e).into());
+            }
         }
 
         println!("table created, attempting to acquire lease: {}", worker_id);
@@ -397,14 +406,14 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use std::time::SystemTime;
-    use tokio::sync::{Mutex as TokioMutex, mpsc};
+    use tokio::sync::mpsc;
     use tokio::time::{sleep, timeout};
 
     const TEST_DB_URL: &str = "postgres://postgres:postgres@localhost:5432/postgres";
 
     #[derive(Clone)]
     struct SharedState {
-        counter: Arc<TokioMutex<i32>>,
+        counter: Arc<Mutex<i32>>,
         message: String,
     }
 
@@ -425,12 +434,12 @@ mod tests {
         let (lease_held_tx, mut lease_held_rx) = mpsc::channel::<bool>(1);
         let (lease_complete_tx, mut lease_complete_rx) = mpsc::channel::<bool>(1);
 
-        let lease_held_tx = Arc::new(tokio::sync::Mutex::new(Some(lease_held_tx)));
-        let lease_complete_tx = Arc::new(tokio::sync::Mutex::new(Some(lease_complete_tx)));
+        let lease_held_tx = Arc::new(Mutex::new(Some(lease_held_tx)));
+        let lease_complete_tx = Arc::new(Mutex::new(Some(lease_complete_tx)));
 
         // Create shared state that the looper function can access
         let shared_state = SharedState {
-            counter: Arc::new(TokioMutex::new(0)),
+            counter: Arc::new(Mutex::new(0)),
             message: "Hello from shared state!".to_string(),
         };
 
