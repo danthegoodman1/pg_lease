@@ -340,3 +340,102 @@ func TestLeaseHeartbeatFailure(t *testing.T) {
 		t.Fatalf("Worker-1 should have lost lease within 2 seconds after worker-2 acquired it")
 	}
 }
+
+func TestLeaseNoHeartbeat(t *testing.T) {
+	// This test verifies that when LeaseHeartbeatInterval = 0:
+	// 1. No heartbeat loop is launched (check logs for "launching heartbeat loop")
+	// 2. Worker continues running even after lease expires in database
+	// 3. Other workers can "steal" the expired lease while original worker still runs
+	// 4. Original worker doesn't detect lease loss automatically (no context cancellation)
+
+	pool, err := pgxpool.New(context.Background(), testDBURL)
+	if err != nil {
+		t.Fatalf("Failed to connect to database: %v", err)
+	}
+	defer pool.Close()
+
+	leaseName := fmt.Sprintf("test-lease-no-heartbeat-%d", time.Now().UnixNano())
+	leaseDuration := 1 * time.Second // Short lease duration
+	loopInterval := 100 * time.Millisecond
+
+	worker1Got := make(chan bool, 1)
+	worker1Lost := make(chan bool, 1)
+	worker2Got := make(chan bool, 1)
+
+	// Worker 1: Has no heartbeating (LeaseHeartbeatInterval = 0)
+	looper1 := NewLeaseLooper(func(leaseContext LeaseContext) error {
+		t.Logf("Worker-1 acquired lease %s", leaseName)
+		worker1Got <- true
+
+		// Keep running indefinitely - with no heartbeating, worker doesn't know when lease expires
+		// Worker-2 should be able to steal the lease after it expires in the database
+		<-leaseContext.Context.Done() // Wait until context is canceled (when we stop the looper)
+		t.Logf("Worker-1 context canceled")
+		worker1Lost <- true
+		return leaseContext.Context.Err()
+	}, "worker-1", leaseName, pool,
+		Options{
+			LeaseDuration:          leaseDuration,
+			LoopInterval:           loopInterval,
+			LoopIntervalJitter:     time.Duration(0),
+			LeaseHeartbeatInterval: 0, // DISABLE heartbeating - no background renewal
+		})
+
+	// Worker 2: Normal worker to acquire lease after worker 1 loses it
+	looper2 := NewLeaseLooper(func(leaseContext LeaseContext) error {
+		t.Logf("Worker-2 acquired lease %s", leaseName)
+		worker2Got <- true
+		<-leaseContext.Context.Done() // Hold until stopped
+		return leaseContext.Context.Err()
+	}, "worker-2", leaseName, pool,
+		Options{
+			LeaseDuration:          leaseDuration,
+			LoopInterval:           loopInterval,
+			LoopIntervalJitter:     time.Duration(0),
+			LeaseHeartbeatInterval: time.Millisecond * 200, // Normal heartbeat
+		})
+
+	// Start worker 1 first
+	go func() {
+		err := looper1.Start()
+		if err != nil {
+			t.Logf("Worker-1 stopped: %v", err)
+		}
+	}()
+
+	// Wait for worker 1 to get the lease
+	select {
+	case <-worker1Got:
+		t.Logf("Worker-1 acquired lease")
+	case <-time.After(3 * time.Second):
+		t.Fatalf("Worker-1 failed to acquire lease within 3 seconds")
+	}
+
+	// Start worker 2 after a short delay to let worker 1 get established
+	time.Sleep(200 * time.Millisecond)
+	go func() {
+		err := looper2.Start()
+		if err != nil {
+			t.Logf("Worker-2 stopped: %v", err)
+		}
+	}()
+	defer looper2.Stop()
+
+	// Wait for worker 2 to steal the lease (should happen after lease expires ~1 second)
+	select {
+	case <-worker2Got:
+		t.Logf("Worker-2 stole the lease after it expired (proving no heartbeating on worker-1)")
+		// Now stop worker-1 since worker-2 has the lease
+		looper1.Stop()
+	case <-time.After(3 * time.Second):
+		t.Fatalf("Worker-2 should have stolen the lease within 3 seconds after lease expiration")
+	}
+
+	// Wait for worker 1 to finish after being stopped
+	select {
+	case <-worker1Lost:
+		t.Logf("Worker-1 finished after being stopped")
+	case <-time.After(2 * time.Second):
+		t.Fatalf("Worker-1 should have finished within 2 seconds after being stopped")
+	}
+}

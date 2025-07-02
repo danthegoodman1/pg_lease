@@ -171,17 +171,26 @@ where
                 state.clone(),
             ));
 
-            let heartbeat_handle = tokio::task::spawn(Self::heartbeat_loop(
-                looper_handle.abort_handle(),
-                pool.clone(),
-                lease_name.clone(),
-                worker_id.clone(),
-                options,
-            ));
+            // Only launch heartbeat loop if lease_heartbeat_interval > 0
+            let heartbeat_handle = if options.lease_heartbeat_interval > Duration::from_secs(0) {
+                println!("launching heartbeat loop {}", worker_id);
+                Some(tokio::task::spawn(Self::heartbeat_loop(
+                    looper_handle.abort_handle(),
+                    pool.clone(),
+                    lease_name.clone(),
+                    worker_id.clone(),
+                    options,
+                )))
+            } else {
+                None
+            };
 
             let looper_join_result = looper_handle.await;
 
-            heartbeat_handle.abort();
+            // Only abort heartbeat if it was started
+            if let Some(handle) = heartbeat_handle {
+                handle.abort();
+            }
 
             match looper_join_result {
                 Ok(Ok(())) => {
@@ -992,5 +1001,143 @@ mod tests {
 
         looper.stop().await?;
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_lease_no_heartbeat() -> Result<(), Box<dyn Error + Send + Sync>> {
+        // This test verifies that when lease_heartbeat_interval = 0:
+        // 1. No heartbeat loop is launched (check logs for "launching heartbeat loop")
+        // 2. Worker continues running even after lease expires in database
+        // 3. Other workers can "steal" the expired lease while original worker still runs
+        // 4. Original worker doesn't detect lease loss automatically (no task cancellation)
+
+        let pool = sqlx::PgPool::connect(TEST_DB_URL).await?;
+
+        let lease_name = format!(
+            "test-lease-no-heartbeat-{}",
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let lease_duration = Duration::from_secs(1); // Short lease duration
+        let loop_interval = Duration::from_millis(100);
+
+        let (worker1_got_tx, mut worker1_got_rx) = mpsc::channel::<bool>(1);
+        let (worker2_got_tx, mut worker2_got_rx) = mpsc::channel::<bool>(1);
+
+        // Worker 1: Has no heartbeating (lease_heartbeat_interval = 0)
+        let worker1_func = {
+            let worker1_got_tx = worker1_got_tx.clone();
+            let lease_name = lease_name.clone();
+            move |_, _| {
+                let worker1_got_tx = worker1_got_tx.clone();
+                let lease_name = lease_name.clone();
+                async move {
+                    println!("Worker-1 acquired lease {}", lease_name);
+                    let _ = worker1_got_tx.send(true).await;
+
+                    // Keep running indefinitely - with no heartbeating, worker doesn't know when lease expires
+                    // Worker-2 should be able to steal the lease after it expires in the database
+                    loop {
+                        sleep(Duration::from_millis(100)).await;
+                    }
+                }
+            }
+        };
+
+        // Worker 2: Normal worker to acquire lease after worker 1's lease expires
+        let worker2_func = {
+            let worker2_got_tx = worker2_got_tx.clone();
+            let lease_name = lease_name.clone();
+            move |_, _| {
+                let worker2_got_tx = worker2_got_tx.clone();
+                let lease_name = lease_name.clone();
+                async move {
+                    println!("Worker-2 acquired lease {}", lease_name);
+                    let _ = worker2_got_tx.send(true).await;
+
+                    // Hold until test ends
+                    loop {
+                        sleep(Duration::from_secs(1)).await;
+                    }
+                }
+            }
+        };
+
+        // Worker 1 options with disabled heartbeating
+        let worker1_options = LeaseLooperOptions {
+            loop_interval,
+            loop_interval_jitter: Duration::from_secs(0),
+            lease_duration,
+            lease_heartbeat_interval: Duration::from_secs(0), // DISABLE heartbeating - no background renewal
+        };
+
+        // Worker 2 options with normal heartbeating
+        let worker2_options = LeaseLooperOptions {
+            loop_interval,
+            loop_interval_jitter: Duration::from_secs(0),
+            lease_duration,
+            lease_heartbeat_interval: Duration::from_millis(200), // Normal heartbeat
+        };
+
+        let looper1 = LeaseLooper::new(
+            lease_name.clone(),
+            worker1_func,
+            "worker-1".to_string(),
+            pool.clone(),
+            worker1_options,
+            (),
+        );
+
+        let looper2 = LeaseLooper::new(
+            lease_name.clone(),
+            worker2_func,
+            "worker-2".to_string(),
+            pool.clone(),
+            worker2_options,
+            (),
+        );
+
+        // Start worker 1 first
+        looper1.start().await?;
+
+        // Wait for worker 1 to get the lease
+        let worker1_acquired = timeout(Duration::from_secs(3), worker1_got_rx.recv()).await;
+        match worker1_acquired {
+            Ok(Some(true)) => println!("Worker-1 acquired lease"),
+            _ => {
+                let _ = looper1.stop().await;
+                panic!("Worker-1 failed to acquire lease within 3 seconds");
+            }
+        }
+
+        // Start worker 2 after a short delay to let worker 1 get established
+        sleep(Duration::from_millis(200)).await;
+        looper2.start().await?;
+
+        // Wait for worker 2 to steal the lease (should happen after lease expires ~1 second)
+        let worker2_acquired = timeout(Duration::from_secs(3), worker2_got_rx.recv()).await;
+        match worker2_acquired {
+            Ok(Some(true)) => {
+                println!(
+                    "Worker-2 stole the lease after it expired (proving no heartbeating on worker-1)"
+                );
+                // Now stop both workers
+                let _ = looper1.stop().await;
+                let _ = looper2.stop().await;
+                println!(
+                    "Test passed: Worker-2 successfully acquired lease after worker-1's lease expired naturally"
+                );
+                Ok(())
+            }
+            _ => {
+                let _ = looper1.stop().await;
+                let _ = looper2.stop().await;
+                panic!(
+                    "Worker-2 should have stolen the lease within 3 seconds after lease expiration"
+                );
+            }
+        }
     }
 }

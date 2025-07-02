@@ -204,7 +204,11 @@ func (looper *LeaseLooper) leaseHandler(ctx context.Context) error {
 		})
 	}()
 
-	go looper.launchHeartbeatLoop(leaseCtx, cancel)
+	// Only launch heartbeat loop if LeaseHeartbeatInterval > 0
+	if looper.options.LeaseHeartbeatInterval > 0 {
+		fmt.Println("launching heartbeat loop", looper.workerID)
+		go looper.launchHeartbeatLoop(leaseCtx, cancel)
+	}
 
 	select {
 	case err := <-looperFuncChan:
